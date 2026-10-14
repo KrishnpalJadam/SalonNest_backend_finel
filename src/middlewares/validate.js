@@ -1,0 +1,1472 @@
+import { z } from "zod";
+
+const fieldLabelAliases = {
+  durationMin: "Duration",
+  monthlyPrice: "Monthly Price",
+  yearlyPrice: "Yearly Price",
+  trialDays: "Trial Days",
+  branchLimit: "Branch Limit",
+  userLimit: "User Limit",
+  customerLimit: "Customer Limit",
+  invoiceLimit: "Invoice Limit",
+  storageLimit: "Storage Limit",
+  taxRate: "Tax Rate",
+  categoryId: "Service Category",
+  gender: "Gender",
+  roleTitle: "Role Title",
+  ownerName: "Owner Name",
+  ownerEmail: "Owner Email",
+  ownerPassword: "Owner Password",
+  loginAccessToken: "Secure Login Token",
+  startsAt: "Start Date",
+  endsAt: "End Date",
+  userSalonId: "Staff User",
+  serviceId: "Service",
+  branchId: "Branch",
+  salonId: "Salon ID",
+  planId: "Plan ID",
+  customerId: "Customer",
+  staffUserId: "Assigned Staff",
+  packageId: "Package",
+  membershipPlanId: "Membership Plan",
+  customRoleId: "Custom Role",
+  customSlug: "Catalog Slug",
+  catalogEnabled: "Catalog Enabled",
+  googleReviewLink: "Google Review Link",
+  themeColor: "Theme Color",
+  beforeAfterGallery: "Before/After Gallery",
+  orderId: "Order",
+  fulfillmentMethod: "Fulfillment Method",
+  audienceFilter: "Audience Filter",
+  scheduledFor: "Schedule Time",
+  type: "Template Type",
+  content: "Template Content",
+  company: "Salon Name",
+  pointsPerCurrency: "Points Per Currency",
+  minRedeemPoints: "Minimum Redeem Points",
+  maxRedeemPercent: "Maximum Redemption Percent",
+  discountValue: "Discount Value",
+  usageLimit: "Usage Limit",
+  customerUsageLimit: "Customer Usage Limit",
+  minBillAmount: "Minimum Bill Amount",
+  expenseDate: "Expense Date",
+  periodStart: "Period Start",
+  periodEnd: "Period End",
+  eventKey: "Automation Event",
+  templateType: "Template Type"
+};
+
+const toFieldLabel = (path = []) => {
+  const key = String(path[path.length - 1] || "request");
+  if (fieldLabelAliases[key]) return fieldLabelAliases[key];
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+    .replace(/\bId\b/g, "ID");
+};
+
+const normalizeIssueMessage = (issue) => {
+  const fieldLabel = toFieldLabel(issue.path);
+
+  if (issue.code === "invalid_type" && issue.expected && issue.received === undefined) {
+    return `${fieldLabel} is required`;
+  }
+
+  if (issue.code === "too_small") {
+    if (issue.origin === "string") {
+      if (String(issue.path?.[issue.path.length - 1] || "").endsWith("Id")) return `${fieldLabel} is required`;
+      if (issue.minimum <= 1) return `${fieldLabel} is required`;
+      if (issue.minimum <= 2) return `${fieldLabel} must be at least 2 characters`;
+      return `${fieldLabel} must be at least ${issue.minimum} characters`;
+    }
+    if (issue.origin === "number") {
+      return `${fieldLabel} must be at least ${issue.minimum}`;
+    }
+    if (issue.origin === "array") {
+      return `${fieldLabel} must include at least ${issue.minimum} item${issue.minimum === 1 ? "" : "s"}`;
+    }
+  }
+
+  if (issue.code === "too_big") {
+    if (issue.origin === "string") return `${fieldLabel} must be at most ${issue.maximum} characters`;
+    if (issue.origin === "number") return `${fieldLabel} must be at most ${issue.maximum}`;
+  }
+
+  if (issue.code === "invalid_value") {
+    return `${fieldLabel} has an invalid value`;
+  }
+
+  if (issue.code === "invalid_enum_value") {
+    return `${fieldLabel} must be one of: ${issue.options?.join(", ") || "valid options"}`;
+  }
+
+  if (issue.code === "invalid_string") {
+    if (issue.validation === "email") return `${fieldLabel} must be a valid email address`;
+    if (issue.validation === "url") return `${fieldLabel} must be a valid URL`;
+    if (issue.validation === "regex") return `${fieldLabel} format is invalid`;
+    return `${fieldLabel} format is invalid`;
+  }
+
+  return issue.message || "Invalid value";
+};
+
+export const validate = (schema) => (req, res, next) => {
+  const parsed = schema.safeParse({ body: req.body, params: req.params, query: req.query });
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map((issue) => ({
+      ...issue,
+      message: normalizeIssueMessage(issue),
+      field: issue.path.filter((part) => part !== "body" && part !== "params" && part !== "query").join(".") || "request"
+    }));
+    const firstIssue = issues[0];
+    return res.status(400).json({
+      message: firstIssue ? `${firstIssue.field}: ${firstIssue.message}` : "Validation error",
+      issues
+    });
+  }
+  if (parsed.data.body) req.body = parsed.data.body;
+  if (parsed.data.params) req.params = parsed.data.params;
+  if (parsed.data.query) req.query = parsed.data.query;
+  next();
+};
+
+const permissionMap = z.record(z.array(z.string()));
+const idSchema = z.string().min(8).max(50);
+const optionalString = z.string().max(500).nullable().optional();
+const normalizeIndianPhone = (value) => {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  let digits = raw.replace(/\D/g, "");
+  if (digits.startsWith("0091")) digits = digits.slice(4);
+  else if (digits.startsWith("91") && digits.length > 10) digits = digits.slice(2);
+  else if (digits.startsWith("0") && digits.length === 11) digits = digits.slice(1);
+  return `+91${digits}`;
+};
+const isValidPhone = (value) => {
+  const raw = String(value ?? "").trim();
+  if (!raw) return false;
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length === 10) return true;
+  if (digits.length === 11 && digits.startsWith("0")) return true;
+  if (digits.length === 12 && digits.startsWith("91")) return true;
+  if (digits.length === 13 && digits.startsWith("091")) return true;
+  return false;
+};
+const indianPhoneSchema = z.string().trim()
+  .refine((value) => isValidPhone(value), "Enter a valid 10-digit phone number");
+const requiredIndianPhoneSchema = z.string().trim()
+  .min(5, "Phone must be at least 5 characters")
+  .refine((value) => isValidPhone(value), "Enter a valid 10-digit phone number");
+const optionalIndianPhoneSchema = z.union([z.literal(""), indianPhoneSchema]).nullable().optional()
+  .transform((value) => value || undefined);
+const vendorPhoneSchema = z.string().trim().refine(
+  (value) => isValidPhone(value),
+  "Enter a valid 10-digit phone number"
+);
+const optionalVendorPhoneSchema = z.union([z.literal(""), vendorPhoneSchema]).optional()
+  .transform((value) => value || undefined);
+const emailOrIndianPhoneSchema = z.string().trim().transform((value) => (
+  value.includes("@") ? value : value
+)).refine((value) => (
+  value.includes("@")
+    ? /^[^\s@]+@(?:[^\s@]+\.[^\s@]+|local)$/i.test(value)
+    : isValidPhone(value)
+), "Enter a valid email address or phone number");
+const isValidDateString = (value) => !Number.isNaN(Date.parse(String(value)));
+const requiredDateString = z.string().trim().min(1).pipe(z.string().refine(isValidDateString, "Invalid date"));
+const optionalDateString = z.union([z.literal(""), z.string().trim().refine(isValidDateString, "Invalid date")]).optional();
+const paymentModeEnum = z.enum(["CASH", "CARD", "UPI", "BANK_TRANSFER", "WALLET", "ONLINE", "ADVANCE"]);
+const onlineOrderStatusEnum = z.enum(["NEW", "ACCEPTED", "READY", "COMPLETED", "CANCELLED"]);
+const orderPaymentStatusEnum = z.enum(["PENDING", "PAID", "FAILED", "REFUNDED"]);
+const emailLikeSchema = z.string().trim().refine(
+  (value) => /^[^\s@]+@(?:[^\s@]+\.[^\s@]+|local)$/i.test(value),
+  "Invalid email address"
+);
+const optionalEmailLike = z.union([emailLikeSchema, z.literal("")]).nullable().optional();
+
+const invoiceItemSchema = z.object({
+  itemType: z.enum(["SERVICE", "PRODUCT", "MEMBERSHIP", "PACKAGE", "GIFT_CARD"]).optional(),
+  serviceId: z.string().max(50).optional(),
+  productId: z.string().max(50).optional(),
+  membershipPlanId: z.string().max(50).optional(),
+  packageId: z.string().max(50).optional(),
+  giftCardId: z.string().max(50).optional(),
+  serviceName: z.string().min(1).max(300).optional(),
+  productName: z.string().max(300).optional(),
+  staffUserId: z.string().max(50).optional(),
+  staffName: z.string().max(200).optional(),
+  variationName: z.string().max(100).optional(),
+  complimentaryRemark: z.string().max(500).optional(),
+  qty: z.number().positive().max(99999),
+  unitPrice: z.number().nonnegative().max(9999999).optional(),
+  taxPct: z.number().min(0).max(100).default(0),
+  packageSessionsUsed: z.number().int().min(0).max(999).optional(),
+  membershipWalletUsed: z.number().min(0).max(9999999).optional(),
+  validityDays: z.number().int().positive().max(3650).optional(),
+  gcCode: z.string().max(50).optional(),
+  isCustom: z.boolean().optional(),
+  customServices: z.array(z.any()).optional(),
+  customProducts: z.array(z.any()).optional(),
+  consumableItems: z.array(z.object({ productId: z.string().optional(), name: z.string().optional(), qty: z.number().optional(), unit: z.string().optional() })).optional(),
+  purchaseDate: z.string().optional()
+}).refine((value) => value.serviceId || value.productId || value.membershipPlanId || value.packageId || value.giftCardId || value.serviceName, {
+  message: "At least one invoice item reference or name is required"
+});
+
+const packageRedemptionSchema = z.object({
+  customerPackageId: idSchema,
+  serviceId: idSchema,
+  sessionsUsed: z.number().int().positive().optional(),
+  note: optionalString
+});
+
+const cartItemSchema = z.object({
+  productId: idSchema,
+  qty: z.number().int().positive()
+});
+
+const appointmentServiceItemSchema = z.object({
+  serviceId: idSchema,
+  staffUserIds: z.array(idSchema).optional().default([]),
+  startAt: requiredDateString,
+  endAt: requiredDateString,
+  notes: optionalString
+});
+
+export const schemas = {
+  register: z.object({ body: z.object({ name: z.string().min(2), email: emailLikeSchema, password: z.string().min(6), salonId: z.string().optional() }) }),
+  login: z.object({ body: z.object({ email: emailLikeSchema, password: z.string().min(6), loginAccessToken: z.string().optional(), rememberMe: z.boolean().optional() }) }),
+  forgotPassword: z.object({ body: z.object({ email: emailLikeSchema }) }),
+  validateResetToken: z.object({ body: z.object({ token: z.string().min(12) }) }),
+  resetPassword: z.object({ body: z.object({ token: z.string().min(12), password: z.string().min(8) }) }),
+
+  salon: z.object({
+    body: z.object({
+      name: z.string().min(2),
+      slug: z.string().min(2),
+      businessType: optionalString,
+      logoUrl: optionalString,
+      email: optionalEmailLike,
+      phone: optionalString,
+      address: optionalString,
+      taxRate: z.number().min(0).optional(),
+      trialStartsAt: optionalDateString,
+      trialEndsAt: optionalDateString,
+      internalNote: optionalString,
+      ownerName: z.string().min(2).optional(),
+      ownerEmail: optionalEmailLike,
+      ownerPassword: z.string().min(6).optional(),
+      featureFlags: z.record(z.boolean()).optional()
+    })
+  }),
+  plan: z.object({
+    body: z.object({
+      name: z.string().min(1),
+      monthlyPrice: z.number().min(0),
+      yearlyPrice: z.number().min(0),
+      trialDays: z.number().int().min(0),
+      branchLimit: z.number().int().min(0),
+      userLimit: z.number().int().min(0),
+      customerLimit: z.number().int().min(0),
+      invoiceLimit: z.number().int().min(0),
+      storageLimit: z.number().int().min(0).optional(),
+      isCustom: z.boolean().optional(),
+      isPopular: z.boolean().optional(),
+      featureFlags: z.record(z.boolean()).optional()
+    })
+  }),
+  salonUpdate: z.object({
+    body: z.object({
+      name: z.string().min(2).optional(),
+      slug: z.string().min(2).optional(),
+      businessType: optionalString,
+      logoUrl: optionalString,
+      email: optionalEmailLike,
+      phone: optionalString,
+      address: optionalString,
+      taxRate: z.number().min(0).optional(),
+      internalNote: optionalString,
+      featureFlags: z.record(z.boolean()).optional()
+    })
+  }),
+  planUpdate: z.object({
+    body: z.object({
+      name: z.string().min(1).optional(),
+      monthlyPrice: z.number().min(0).optional(),
+      yearlyPrice: z.number().min(0).optional(),
+      trialDays: z.number().int().min(0).optional(),
+      branchLimit: z.number().int().min(0).optional(),
+      userLimit: z.number().int().min(0).optional(),
+      customerLimit: z.number().int().min(0).optional(),
+      invoiceLimit: z.number().int().min(0).optional(),
+      storageLimit: z.number().int().min(0).optional(),
+      isCustom: z.boolean().optional(),
+      isPopular: z.boolean().optional(),
+      featureFlags: z.record(z.boolean()).optional()
+    })
+  }),
+  subscription: z.object({
+    body: z.object({
+      salonId: idSchema,
+      planId: idSchema,
+      status: z.enum(["TRIAL", "ACTIVE", "EXPIRED", "SUSPENDED"]),
+      paymentStatus: optionalString,
+      manualDiscount: z.number().min(0).optional(),
+      notes: optionalString,
+      startsAt: requiredDateString,
+      endsAt: requiredDateString
+    })
+  }),
+  convertSubscription: z.object({
+    body: z.object({
+      planId: z.string().optional(),
+      endsAt: optionalDateString,
+      paymentStatus: z.string().optional(),
+      manualDiscount: z.number().min(0).optional(),
+      notes: z.string().optional()
+    })
+  }),
+  branch: z.object({
+    body: z.object({
+      name: z.string().min(2),
+      phone: optionalIndianPhoneSchema,
+      email: optionalEmailLike,
+      address: optionalString,
+      businessHours: optionalString,
+      weeklyOff: optionalString,
+      latitude: z.number().min(-90).max(90).nullable().optional(),
+      longitude: z.number().min(-180).max(180).nullable().optional(),
+      geofenceRadiusMeters: z.number().int().min(10).max(1000).nullable().optional()
+    })
+  }),
+  service: z.object({
+    body: z.object({
+      name: z.string().trim().min(2).max(300),
+      position: z.number().int().min(0).max(9999).optional(),
+      price: z.number().nonnegative().max(9999999),
+      salePrice: z.number().min(0).max(9999999).nullable().optional(),
+      durationMin: z.number().int().positive().max(1440),
+      branchId: z.string().optional(),
+      categoryId: z.string().max(50).nullable().optional(),
+      description: z.string().max(5000).optional(),
+      gender: z.enum(["MALE", "FEMALE", "UNISEX"]).optional(),
+      taxRate: z.number().min(0).max(100).optional(),
+      onlineBookingEnabled: z.boolean().optional(),
+      commissionPct: z.number().min(0).max(100).optional(),
+      isFeatured: z.boolean().optional(),
+      isPopular: z.boolean().optional(),
+      hideFromCatalogue: z.boolean().optional(),
+      nonDiscountable: z.boolean().optional(),
+      serviceTag: z.string().max(100).optional(),
+      serviceRemainderDays: z.number().int().min(0).max(365).optional(),
+      imageUrl: z.string().max(2000).optional().nullable(),
+      consumables: z.array(z.object({ productId: z.string().max(50), variation: z.string().max(20).nullable().optional(), reqdQty: z.number().min(0).max(9999) })).max(50).optional(),
+      taxes: z.array(z.object({ name: z.string().trim().min(1).max(100), rate: z.number().min(0).max(100) })).max(20).optional()
+    })
+  }),
+  customer: z.object({
+    body: z.object({
+      name: z.string().trim().min(1).max(200),
+      phone: requiredIndianPhoneSchema,
+      email: optionalEmailLike,
+      branchId: z.string().optional(),
+      gender: z.enum(["MALE", "FEMALE", "OTHER", "PREFER_NOT_TO_SAY"]).optional().or(z.literal("")),
+      dateOfBirth: optionalDateString,
+      anniversary: optionalDateString,
+      source: z.string().max(100).optional(),
+      tags: z.array(z.string().max(50)).optional(),
+      notes: z.string().max(2000).optional(),
+      preferences: z.string().max(2000).optional(),
+      preferredStaffId: z.string().max(50).optional(),
+      allergies: z.string().max(2000).optional(),
+      skinNotes: z.string().max(2000).optional()
+    })
+  }),
+  customerPatch: z.object({
+    body: z.object({
+      name: z.string().trim().min(2).max(200).optional(),
+      phone: indianPhoneSchema.optional(),
+      email: optionalEmailLike,
+      branchId: z.string().optional(),
+      gender: z.enum(["MALE", "FEMALE", "OTHER", "PREFER_NOT_TO_SAY"]).optional().or(z.literal("")),
+      dateOfBirth: optionalDateString,
+      anniversary: optionalDateString,
+      source: z.string().max(100).optional(),
+      tags: z.array(z.string().max(50)).optional(),
+      notes: optionalString,
+      preferences: optionalString,
+      preferredStaffId: z.string().optional(),
+      allergies: optionalString,
+      skinNotes: optionalString
+    }).refine((body) => Object.keys(body).length > 0, {
+      message: "At least one customer field is required"
+    })
+  }),
+  customerFollowUp: z.object({
+    body: z.object({
+      customerId: idSchema,
+      staffUserId: idSchema,
+      date: requiredDateString,
+      time: optionalString,
+      message: z.string().min(1),
+      type: z.enum(["call", "sms", "whatsapp", "email", "visit"])
+    })
+  }),
+  serviceCategory: z.object({ body: z.object({ name: z.string().trim().min(2).max(200), parentId: z.string().max(50).nullable().optional(), branchId: z.string().max(50).nullable().optional() }) }),
+  ownerUser: z.object({
+    body: z.object({
+      name: z.string().trim().min(2).max(200),
+      email: emailLikeSchema,
+      password: z.string().min(6).max(128).optional(),
+      otpCode: z.string().optional(),
+      salonRole: z.enum(["SALON_OWNER", "MANAGER", "RECEPTIONIST", "STAFF", "INVENTORY_MANAGER", "ACCOUNTANT"]),
+      branchId: z.string().optional(),
+      customRoleId: z.string().optional(),
+      phone: optionalIndianPhoneSchema,
+      profileNote: z.string().max(2000).optional(),
+      avatarUrl: z.string().max(2000).optional(),
+      roleTitle: z.string().trim().max(100).optional(),
+      showInCatalog: z.boolean().optional(),
+      attendanceEnabled: z.boolean().optional(),
+      attendanceEnrollmentPhotoUrl: z.string().max(2000).optional(),
+      serviceIds: z.array(z.string()).optional(),
+      permissions: permissionMap.optional(),
+      joiningDate: optionalDateString,
+      designation: z.string().trim().max(100).optional(),
+      uanNumber: z.string().trim().optional().or(z.literal("")),
+      reportingToId: z.string().optional(),
+      workingHours: z.string().trim().max(100).optional(),
+      bankName: z.string().trim().max(200).optional(),
+      bankBranch: z.string().trim().max(200).optional(),
+      accountNumber: z.string().trim().optional().or(z.literal("")),
+      ifscCode: z.string().trim().optional().or(z.literal(""))
+    })
+  }),
+  userMembershipUpdate: z.object({
+    body: z.object({
+      salonRole: z.enum(["SALON_OWNER", "MANAGER", "RECEPTIONIST", "STAFF", "INVENTORY_MANAGER", "ACCOUNTANT"]).optional(),
+      branchId: z.string().nullable().optional(),
+      customRoleId: z.string().nullable().optional(),
+      phone: optionalIndianPhoneSchema,
+      profileNote: z.string().max(2000).optional(),
+      avatarUrl: z.string().max(2000).optional(),
+      roleTitle: z.string().trim().max(100).optional(),
+      showInCatalog: z.boolean().optional(),
+      attendanceEnabled: z.boolean().optional(),
+      attendanceEnrollmentPhotoUrl: z.string().max(2000).optional(),
+      isArchived: z.boolean().optional(),
+      serviceIds: z.array(z.string()).optional(),
+      permissions: permissionMap.optional(),
+      joiningDate: optionalDateString,
+      designation: z.string().trim().max(100).optional(),
+      uanNumber: z.string().trim().optional().or(z.literal("")),
+      reportingToId: z.string().nullable().optional(),
+      workingHours: z.string().trim().max(100).optional(),
+      bankName: z.string().trim().max(200).optional(),
+      bankBranch: z.string().trim().max(200).optional(),
+      accountNumber: z.string().trim().optional().or(z.literal("")),
+      ifscCode: z.string().trim().optional().or(z.literal(""))
+    }).refine((body) => Object.keys(body).length > 0, { message: "At least one field is required" })
+  }),
+  invoice: z.object({
+    body: z.object({
+      customerId: idSchema,
+      branchId: z.string().optional(),
+      appointmentId: z.string().max(50).nullable().optional(),
+      appliedMembershipId: z.string().max(50).nullable().optional(),
+      mode: z.enum(["draft", "complete", "start"]).optional(),
+      discount: z.number().min(0).max(9999999).default(0),
+      tax: z.number().min(0).max(9999999).default(0),
+      notes: z.string().max(2000).optional(),
+      couponCode: z.string().max(50).optional(),
+      loyaltyPointsUsed: z.number().min(0).max(999999).optional(),
+      giftVoucherCode: z.string().max(50).optional(),
+      consumableOverrides: z.record(z.string(), z.union([z.number(), z.string()])).optional(),
+      affiliateCreditRedemptions: z.array(z.object({
+        partnerId: idSchema,
+        amount: z.number().positive().max(9999999),
+        credits: z.number().positive().max(9999999).optional(),
+        note: z.string().max(500).optional()
+      })).max(10).optional(),
+      items: z.array(invoiceItemSchema).min(1).max(100),
+      packageRedemptions: z.array(packageRedemptionSchema).optional(),
+      payments: z.array(z.object({
+        mode: paymentModeEnum,
+        amount: z.number().positive().max(9999999),
+        note: z.string().max(500).optional()
+      })).max(20).default([])
+    })
+  }),
+  payment: z.object({
+    body: z.object({
+      invoiceId: idSchema,
+      amount: z.number().positive().max(9999999),
+      mode: paymentModeEnum,
+      note: z.string().max(500).optional()
+    })
+  }),
+  refundPayment: z.object({
+    body: z.object({
+      invoiceId: idSchema,
+      amount: z.number().positive(),
+      note: z.string().optional()
+    })
+  }),
+  paymentLink: z.object({
+    body: z.object({
+      expiresAt: optionalDateString,
+      gatewayName: z.string().optional(),
+      note: z.string().optional()
+    })
+  }),
+  paymentLinkLog: z.object({
+    body: z.object({
+      status: z.enum(["SENT", "FAILED", "PAID_PLACEHOLDER"]),
+      note: z.string().optional(),
+      gatewayRef: z.string().optional()
+    })
+  }),
+  demoLead: z.object({
+    body: z.object({
+      name: z.string().min(2),
+      email: emailLikeSchema,
+      phone: indianPhoneSchema,
+      company: z.string().min(2).optional(),
+      salonName: z.string().min(2).optional(),
+      city: z.string().optional(),
+      notes: z.string().optional(),
+      message: z.string().optional(),
+      branchCount: z.union([z.string(), z.number()]).optional()
+    })
+  }),
+  demoLeadReview: z.object({
+    body: z.object({
+      planId: z.string().optional(),
+      trialDays: z.number().int().min(1).max(30).optional(),
+      salonName: z.string().min(2).optional(),
+      businessType: z.string().optional(),
+      reviewNote: z.string().optional()
+    })
+  }),
+  demoLeadReject: z.object({ body: z.object({ reviewNote: z.string().optional(), lostReason: z.string().optional(), lostNotes: z.string().optional() }) }),
+  supportTicket: z.object({ body: z.object({ title: z.string().min(2), category: z.string().optional(), priority: z.string().optional(), description: z.string().optional(), attachmentUrl: z.string().optional() }) }),
+  supportTicketMessage: z.object({ body: z.object({ message: z.string().min(2), attachmentUrl: z.string().optional() }) }),
+  salonSettings: z.object({ body: z.object({ invoicePrefix: z.string().optional(), invoiceFooter: z.string().optional(), taxLabel: z.string().optional(), paymentModes: z.any().optional(), whatsappNumber: optionalIndianPhoneSchema, bookingNotes: z.string().optional(), cancellationPolicy: z.string().optional(), branchId: z.string().nullable().optional(), paymentGatewaySettings: z.any().optional(), advancedSettings: z.any().optional(), smsSettings: z.any().optional(), allowNegativeStock: z.boolean().optional() }) }),
+  customRole: z.object({ body: z.object({ name: z.string().min(2), description: z.string().optional(), permissions: permissionMap }) }),
+
+  appointment: z.object({
+    body: z.object({
+      customerId: idSchema,
+      branchId: idSchema,
+      primaryStaffUserId: z.string().nullable().optional(),
+      title: optionalString,
+      bookingChannel: z.enum(["WALK_IN", "PHONE", "ONLINE", "ONLINE_PLACEHOLDER", "MANUAL"]).default("MANUAL"),
+      status: z.enum(["PENDING", "CONFIRMED", "CHECKED_IN", "IN_PROGRESS", "COMPLETED", "CANCELLED", "NO_SHOW"]).optional(),
+      startAt: requiredDateString,
+      endAt: requiredDateString,
+      notes: optionalString,
+      customerPreferences: optionalString,
+      isWalkIn: z.boolean().optional(),
+      smsToGuest: z.boolean().optional(),
+      smsToOwner: z.boolean().optional(),
+      advancePaymentRequired: z.boolean().optional(),
+      advancePaidAmount: z.number().min(0).optional(),
+      roomResourceNote: optionalString,
+      items: z.array(appointmentServiceItemSchema).min(1)
+    })
+  }),
+  appointmentStatus: z.object({
+    body: z.object({
+      status: z.enum(["PENDING", "CONFIRMED", "CHECKED_IN", "IN_PROGRESS", "COMPLETED", "CANCELLED", "NO_SHOW"]),
+      note: optionalString
+    })
+  }),
+  appointmentNote: z.object({
+    body: z.object({
+      note: optionalString
+    })
+  }),
+  appointmentReschedule: z.object({
+    body: z.object({
+      startAt: requiredDateString,
+      endAt: requiredDateString,
+      note: optionalString,
+      branchId: z.string().optional(),
+      items: z.array(appointmentServiceItemSchema).optional()
+    })
+  }),
+  appointmentSettings: z.object({
+    body: z.object({
+      branchId: z.string().nullable().optional(),
+      autoConfirm: z.boolean().optional(),
+      advancePaymentRequired: z.boolean().optional(),
+      onlineBookingEnabled: z.boolean().optional()
+    })
+  }),
+  staffSchedule: z.object({
+    body: z.object({
+      userSalonId: idSchema,
+      branchId: z.string().nullable().optional(),
+      weekday: z.number().int().min(0).max(6),
+      startTime: z.string().regex(/^\d{2}:\d{2}$/),
+      endTime: z.string().regex(/^\d{2}:\d{2}$/),
+      isOffDay: z.boolean().optional()
+    })
+  }),
+  staffBreak: z.object({
+    body: z.object({
+      userSalonId: idSchema,
+      weekday: z.number().int().min(0).max(6),
+      startTime: z.string().regex(/^\d{2}:\d{2}$/),
+      endTime: z.string().regex(/^\d{2}:\d{2}$/)
+    })
+  }),
+
+  productCategory: z.object({
+    body: z.object({
+      name: z.string().min(2),
+      description: optionalString,
+      imageUrl: optionalString,
+      sortOrder: z.number().int().min(0).optional(),
+      isPublicVisible: z.boolean().optional()
+    })
+  }),
+  product: z.object({
+    body: z.object({
+      branchId: z.string().nullable().optional(),
+      categoryId: z.string().nullable().optional(),
+      name: z.string().min(2),
+      imageUrl: optionalString,
+      displayImages: z.array(z.string()).optional(),
+      sku: optionalString,
+      barcode: optionalString,
+      productType: z.enum(["RETAIL", "CONSUMABLE"]),
+      costPrice: z.number().min(0),
+      sellingPrice: z.number().min(0),
+      salePrice: z.number().min(0).optional(),
+      currentStock: z.number().min(0).optional(),
+      minStock: z.number().min(0).optional(),
+      onFloor: z.number().min(0).optional(),
+      netWeight: z.number().min(0).nullable().optional(),
+      expiryDate: optionalDateString,
+      allowNegativeStock: z.boolean().optional(),
+      featured: z.boolean().optional(),
+      targetGroup: z.enum(["BOTH", "FEMALE", "MALE"]).optional(),
+      hideFromCatalogue: z.boolean().optional(),
+      nonDiscountable: z.boolean().optional(),
+      description: optionalString,
+      videoLink: optionalString,
+      benefits: optionalString,
+      ingredients: optionalString,
+      usageInstructions: optionalString,
+      variations: z.array(z.any()).optional(),
+      weight: z.number().min(0).nullable().optional(),
+      length: z.number().min(0).nullable().optional(),
+      width: z.number().min(0).nullable().optional(),
+      height: z.number().min(0).nullable().optional(),
+      unit: z.string().max(20).nullable().optional(),
+      unitConversion: z.number().min(0).nullable().optional(),
+      discountType: z.enum(["NONE", "FLAT", "PERCENTAGE"]).optional(),
+      discountValue: z.number().min(0).nullable().optional(),
+      favourite: z.boolean().optional()
+    })
+  }),
+  stockMovement: z.object({
+    body: z.object({
+      productId: idSchema,
+      branchId: z.string().nullable().optional(),
+      movementType: z.enum(["STOCK_IN", "STOCK_OUT", "ADJUSTMENT", "PRODUCT_RETURN", "CONSUMABLE_USAGE"]),
+      quantity: z.number().positive(),
+      note: optionalString
+    })
+  }),
+  vendor: z.object({
+    body: z.object({
+      branchId: z.string().nullable().optional(),
+      name: z.string().min(2),
+      firmName: optionalString,
+      phone: optionalVendorPhoneSchema,
+      alternateMobile: optionalVendorPhoneSchema,
+      email: optionalEmailLike,
+      gstNumber: optionalString,
+      address: optionalString,
+      area: optionalString,
+      landmark: optionalString,
+      city: optionalString,
+      pincode: optionalString,
+      notes: optionalString,
+      isActive: z.boolean().optional()
+    })
+  }),
+  vendorItem: z.object({
+    body: z.object({
+      productId: idSchema,
+      price: z.number().min(0),
+      isActive: z.boolean().optional()
+    })
+  }),
+  purchaseOrder: z.object({
+    body: z.object({
+      branchId: idSchema,
+      vendorId: idSchema,
+      notes: optionalString,
+      status: z.enum(["DRAFT", "ORDERED", "PARTIALLY_RECEIVED", "RECEIVED", "CANCELLED"]).optional(),
+      items: z.array(z.object({
+        productId: idSchema,
+        quantityOrdered: z.number().positive(),
+        unitCost: z.number().min(0),
+        expiryDate: optionalDateString
+      })).min(1)
+    })
+  }),
+  purchaseReceive: z.object({
+    body: z.object({
+      items: z.array(z.object({
+        purchaseOrderItemId: idSchema,
+        quantityReceived: z.number().positive()
+      })).min(1)
+    })
+  }),
+  stockTransfer: z.object({
+    body: z.object({
+      fromBranchId: idSchema,
+      toBranchId: idSchema,
+      note: optionalString,
+      items: z.array(z.object({
+        productId: idSchema,
+        quantity: z.number().positive()
+      })).min(1)
+    })
+  }),
+  stockReconciliation: z.object({
+    body: z.object({
+      branchId: idSchema,
+      note: optionalString,
+      items: z.array(z.object({
+        productId: idSchema,
+        physicalStock: z.number().min(0)
+      })).min(1)
+    })
+  }),
+
+  membershipPlan: z.object({
+    body: z.object({
+      name: z.string().min(2),
+      description: optionalString,
+      branchId: z.string().nullable().optional(),
+      benefits: z.array(z.object({
+        label: z.string().min(1),
+        value: optionalString
+      })).optional(),
+      price: z.number().min(0),
+      validityDays: z.number().int().positive(),
+      benefitType: z.enum(["DISCOUNT_PERCENT", "DISCOUNT_AMOUNT", "WALLET_VALUE"]),
+      discountValue: z.number().min(0).nullish(),
+      walletValue: z.number().min(0).nullish(),
+      serviceSpecificOnly: z.boolean().optional(),
+      isActive: z.boolean().optional(),
+      renewalReminder: z.number().int().min(0).optional(),
+      sharable: z.boolean().optional(),
+      maxShareCount: z.number().int().min(0).nullish(),
+      serviceIds: z.array(idSchema).optional()
+    })
+  }),
+  membershipRenew: z.object({
+    body: z.object({
+      note: optionalString
+    })
+  }),
+  membershipTopUp: z.object({
+    body: z.object({
+      amount: z.number().positive(),
+      note: optionalString
+    })
+  }),
+  membershipUpgrade: z.object({
+    body: z.object({
+      membershipPlanId: idSchema,
+      note: optionalString
+    })
+  }),
+  membershipTransfer: z.object({
+    body: z.object({
+      customerId: idSchema,
+      note: optionalString
+    })
+  }),
+  assignMembership: z.object({
+    body: z.object({
+      customerId: idSchema,
+      membershipPlanId: z.string(),
+      soldInvoiceId: z.string().nullish(),
+      startsAt: optionalDateString,
+      staffId: z.string().optional().nullable(),
+      price: z.number().optional(),
+      validityDays: z.number().optional(),
+      customServices: z.array(z.any()).optional(),
+      isCustom: z.boolean().optional(),
+      name: z.string().optional(),
+      online: z.number().optional().nullable(),
+      offline: z.number().optional().nullable(),
+      balance: z.number().optional().nullable(),
+      advance: z.number().optional().nullable(),
+      remarks: z.string().optional().nullable()
+    })
+  }),
+  packagePlan: z.object({
+    body: z.object({
+      name: z.string().min(2),
+      price: z.number().min(0),
+      totalSessions: z.number().int().positive(),
+      validityDays: z.number().int().positive(),
+      branchId: z.string().nullable().optional(),
+      isActive: z.boolean().optional(),
+      services: z.array(z.object({
+        serviceId: idSchema,
+        sessions: z.number().int().positive().optional()
+      })).optional(),
+      products: z.array(z.object({
+        productId: idSchema,
+        quantity: z.number().int().positive().optional()
+      })).optional()
+    })
+  }),
+  packageRenew: z.object({
+    body: z.object({
+      additionalSessions: z.number().int().min(0).optional(),
+      note: optionalString
+    })
+  }),
+  packageTransfer: z.object({
+    body: z.object({
+      customerId: idSchema,
+      note: optionalString
+    })
+  }),
+  assignPackage: z.object({
+    body: z.object({
+      customerId: idSchema,
+      packageId: z.string(),
+      soldInvoiceId: z.string().nullish(),
+      startsAt: optionalDateString,
+      staffId: z.string().optional().nullable(),
+      price: z.number().optional(),
+      validityDays: z.number().optional(),
+      customServices: z.array(z.any()).optional(),
+      isCustom: z.boolean().optional(),
+      name: z.string().optional(),
+      online: z.number().optional().nullable(),
+      offline: z.number().optional().nullable(),
+      balance: z.number().optional().nullable(),
+      advance: z.number().optional().nullable(),
+      remarks: z.string().optional().nullable(),
+      notes: z.string().optional().nullable(),
+      remark: z.string().optional().nullable()
+    })
+  }),
+  packageRedeem: z.object({
+    body: z.object({
+      customerPackageId: idSchema,
+      serviceId: idSchema,
+      sessionsUsed: z.number().int().positive().optional(),
+      invoiceId: z.string().nullish(),
+      appointmentId: z.string().optional(),
+      note: optionalString
+    })
+  }),
+
+  catalogSettings: z.object({
+    body: z.object({
+      branchId: z.string().nullable().optional(),
+      catalogEnabled: z.boolean().optional(),
+      customSlug: z.string().min(2).optional(),
+      logoUrl: optionalString,
+      bannerUrl: optionalString,
+      showServices: z.boolean().optional(),
+      showPackages: z.boolean().optional(),
+      showMemberships: z.boolean().optional(),
+      showProducts: z.boolean().optional(),
+      showStaffPortfolio: z.boolean().optional(),
+      whatsappNumber: optionalString,
+      googleReviewLink: optionalString,
+      socialLinks: z.any().optional(),
+      branchDisplaySettings: z.any().optional(),
+      beforeAfterGallery: z.any().optional(),
+      themeColor: optionalString,
+      allowSuspendedCatalog: z.boolean().optional()
+    })
+  }),
+  catalogBanner: z.object({
+    body: z.object({
+      title: z.string().min(2),
+      subtitle: optionalString,
+      imageUrl: optionalString,
+      linkUrl: optionalString,
+      sortOrder: z.number().int().min(0).optional(),
+      isActive: z.boolean().optional()
+    })
+  }),
+  catalogOffer: z.object({
+    body: z.object({
+      title: z.string().min(2),
+      description: optionalString,
+      imageUrl: optionalString,
+      ctaLabel: optionalString,
+      ctaUrl: optionalString,
+      branchId: z.string().nullable().optional(),
+      startsAt: optionalDateString,
+      endsAt: optionalDateString,
+      isActive: z.boolean().optional()
+    })
+  }),
+  catalogEvent: z.object({
+    body: z.object({
+      eventType: z.enum(["QR_SCAN", "PAGE_VIEW", "SERVICE_VIEW", "PRODUCT_CLICK", "BOOKING_CLICK", "WHATSAPP_CLICK", "OFFER_CLICK", "SHOP_CLICK"]),
+      branchId: z.string().nullable().optional(),
+      serviceId: z.string().optional(),
+      productId: z.string().optional(),
+      offerId: z.string().optional(),
+      metadata: z.any().optional()
+    })
+  }),
+  publicBooking: z.object({
+    body: z.object({
+      customerName: z.string().min(2),
+      customerPhone: indianPhoneSchema,
+      customerEmail: optionalEmailLike,
+      branchId: idSchema,
+      primaryStaffUserId: z.string().nullable().optional(),
+      startAt: requiredDateString,
+      endAt: requiredDateString,
+      notes: optionalString,
+      customerPreferences: optionalString,
+      items: z.array(appointmentServiceItemSchema).min(1)
+    })
+  }),
+  ecommerceSettings: z.object({
+    body: z.object({
+      storeEnabled: z.boolean().optional(),
+      allowCod: z.boolean().optional(),
+      allowPayAtSalon: z.boolean().optional(),
+      allowOnlinePayment: z.boolean().optional(),
+      pickupEnabled: z.boolean().optional(),
+      deliveryEnabled: z.boolean().optional(),
+      deliveryNote: optionalString,
+      supportPhone: optionalIndianPhoneSchema,
+      termsText: optionalString
+    })
+  }),
+  onlineVisibility: z.object({
+    body: z.object({
+      isOnlineVisible: z.boolean()
+    })
+  }),
+  cartValidate: z.object({
+    body: z.object({
+      items: z.array(cartItemSchema).min(1)
+    })
+  }),
+  createOrder: z.object({
+    body: z.object({
+      customerId: z.string().optional(),
+      branchId: z.string().nullable().optional(),
+      customerName: z.string().min(2),
+      customerPhone: indianPhoneSchema,
+      customerEmail: optionalEmailLike,
+      note: optionalString,
+      paymentMode: z.enum(["COD", "PAY_AT_SALON", "ONLINE_PLACEHOLDER"]).default("PAY_AT_SALON"),
+      fulfillmentMethod: z.enum(["PICKUP", "DELIVERY"]).default("PICKUP"),
+      couponCode: optionalString,
+      giftCardCode: optionalString,
+      items: z.array(cartItemSchema).min(1)
+    })
+  }),
+  orderStatus: z.object({
+    body: z.object({
+      status: onlineOrderStatusEnum,
+      note: optionalString,
+      paymentStatus: orderPaymentStatusEnum.optional()
+    })
+  }),
+  customerRegister: z.object({
+    body: z.object({
+      salonSlug: z.string().min(2),
+      name: z.string().min(2),
+      phone: indianPhoneSchema,
+      email: optionalEmailLike,
+      password: z.string().min(6)
+    })
+  }),
+  customerLogin: z.object({
+    body: z.object({
+      salonSlug: z.string().min(2),
+      emailOrPhone: emailOrIndianPhoneSchema,
+      password: z.string().min(6)
+    })
+  }),
+  customerProfile: z.object({
+    body: z.object({
+      name: z.string().min(2),
+      phone: indianPhoneSchema,
+      email: optionalEmailLike,
+      preferences: optionalString,
+      allergies: optionalString,
+      skinNotes: optionalString
+    })
+  }),
+  customerReschedule: z.object({
+    body: z.object({
+      startAt: requiredDateString,
+      endAt: requiredDateString,
+      note: optionalString
+    })
+  }),
+  customerCancel: z.object({
+    body: z.object({
+      note: optionalString
+    })
+  }),
+  customerFeedback: z.object({
+    body: z.object({
+      appointmentId: z.string().optional(),
+      rating: z.number().int().min(1).max(5),
+      message: optionalString
+    })
+  }),
+  campaign: z.object({
+    body: z.object({
+      name: z.string().min(2),
+      type: z.enum(["WHATSAPP", "SMS", "EMAIL", "SOCIAL_BANNER", "CATALOG_BANNER"]),
+      audienceFilter: z.enum(["ALL_CUSTOMERS", "BIRTHDAY_CUSTOMERS", "ANNIVERSARY_CUSTOMERS", "LOST_CUSTOMERS", "HIGH_SPENDERS", "MEMBERSHIP_CUSTOMERS", "PACKAGE_CUSTOMERS", "SERVICE_BASED_CUSTOMERS", "CRM_SEGMENT", "SELECTED"]),
+      audienceMeta: z.any().optional(),
+      message: optionalString,
+      bannerUrl: optionalString,
+      imageUrl: optionalString,
+      // Without this key Zod strips it, isDraft reads as false and "Save Draft" broadcasts to everyone.
+      isDraft: z.preprocess(
+        (value) => (typeof value === "string" ? value.toLowerCase() === "true" : value),
+        z.boolean().optional()
+      ).optional(),
+      scheduledFor: optionalDateString
+    })
+  }),
+  campaignAction: z.object({
+    body: z.object({
+      scheduledFor: optionalDateString,
+      note: optionalString
+    })
+  }),
+  messageTemplate: z.object({
+    body: z.object({
+      title: z.string().min(2),
+      content: z.string().min(5),
+      variables: z.any().optional()
+    })
+  }),
+  messageTemplatePreview: z.object({
+    body: z.object({
+      customerId: z.string().optional(),
+      appointmentId: z.string().optional(),
+      invoiceId: z.string().optional(),
+      orderId: z.string().optional(),
+      customerMembershipId: z.string().optional(),
+      customerPackageId: z.string().optional()
+    })
+  }),
+  loyaltyRule: z.object({
+    body: z.object({
+      branchId: z.string().nullable().optional(),
+      name: z.string().min(2),
+      pointsPerCurrency: z.number().min(0),
+      serviceMultiplier: z.number().min(0).optional(),
+      productMultiplier: z.number().min(0).optional(),
+      bonusRate: z.number().min(0).optional(),
+      minRedeemPoints: z.number().int().min(0),
+      maxRedeemPercent: z.number().min(0).max(100).optional(),
+      expiryDays: z.number().int().min(0).optional(),
+      birthdayPoints: z.number().int().min(0).optional(),
+      referralPoints: z.number().int().min(0).optional(),
+      isActive: z.boolean().optional(),
+      notes: optionalString
+    })
+  }),
+  loyaltyAdjust: z.object({
+    body: z.object({
+      customerId: idSchema,
+      branchId: z.string().nullable().optional(),
+      points: z.number().int().min(1).max(999999),
+      type: z.enum(["ADJUST", "BONUS", "EXPIRE"]).default("ADJUST"),
+      note: z.string().max(500).optional()
+    })
+  }),
+  coupon: z.object({
+    body: z.object({
+      branchId: z.string().nullable().optional(),
+      serviceId: z.string().nullable().optional(),
+      productId: z.string().nullable().optional(),
+      code: z.string().trim().min(2).max(50),
+      title: z.string().trim().min(2).max(200),
+      description: z.string().max(1000).nullable().optional(),
+      discountType: z.enum(["PERCENT", "FIXED", "CAMPAIGN"]),
+      discountValue: z.number().min(0).max(9999999),
+      minBillAmount: z.number().min(0).max(9999999).optional(),
+      usageLimit: z.number().int().min(0).max(999999).nullable().optional(),
+      customerUsageLimit: z.number().int().min(0).max(999).nullable().optional(),
+      startsAt: optionalDateString,
+      endsAt: optionalDateString,
+      isReferral: z.boolean().optional(),
+      isInfluencer: z.boolean().optional(),
+      isBirthday: z.boolean().optional(),
+      isFestival: z.boolean().optional(),
+      isArchived: z.boolean().optional(),
+      notes: z.string().max(500).nullable().optional()
+    })
+  }),
+  couponValidate: z.object({
+    body: z.object({
+      code: z.string().trim().min(2).max(50),
+      customerId: z.string().max(50).optional(),
+      branchId: z.string().nullable().optional(),
+      serviceIds: z.array(idSchema).optional(),
+      productIds: z.array(idSchema).optional(),
+      subtotal: z.number().min(0).max(9999999)
+    })
+  }),
+  giftCard: z.object({
+    body: z.object({
+      customerId: z.string().nullable().optional(),
+      soldInvoiceId: z.string().nullable().optional(),
+      linkedCampaignId: z.string().nullable().optional(),
+      branchId: z.string().nullable().optional(),
+      code: z.string().trim().min(2).max(50),
+      title: z.string().trim().min(2).max(200),
+      originalAmount: z.coerce.number().positive().max(9999999),
+      balanceAmount: z.coerce.number().min(0).max(9999999).optional(),
+      expiresAt: optionalDateString,
+      isActive: z.boolean().optional(),
+      note: z.string().max(500).optional()
+    })
+  }),
+  giftCardRedeem: z.object({
+      body: z.object({
+        giftCardId: z.string().optional(),
+        id: z.string().optional(),
+        customerId: z.string().nullable().optional(),
+        invoiceId: z.string().nullable().optional(),
+        orderId: z.string().nullable().optional(),
+        amountUsed: z.number().positive()
+      }).refine((body) => Boolean(body.giftCardId || body.id), {
+        message: "giftCardId is required",
+        path: ["giftCardId"]
+      })
+    }),
+  feedbackStatus: z.object({
+    body: z.object({
+      status: z.enum(["NEW", "REVIEWED", "CONTACTED", "RESOLVED"]),
+      internalNotes: optionalString,
+      complaintFollowUpStatus: optionalString
+    })
+  }),
+  feedbackFollowUp: z.object({
+    body: z.object({
+      note: z.string().min(2)
+    })
+  }),
+  enquiry: z.object({
+    body: z.object({
+      name: z.string().min(2),
+      phone: indianPhoneSchema,
+      email: optionalEmailLike,
+      gender: optionalString,
+      source: z.enum(["WEBSITE", "WHATSAPP", "PHONE", "WALK_IN", "INSTAGRAM", "FACEBOOK", "ADS", "REFERRAL", "ONLINE", "OTHERS"]),
+      interestedServiceId: z.string().nullable().optional(),
+      interestedBranchId: z.string().nullable().optional(),
+      budget: z.number().min(0).optional(),
+      priority: optionalString,
+      assignedToMembershipId: z.string().nullable().optional(),
+      followUpAt: requiredDateString,
+      notes: optionalString
+    })
+  }),
+  enquiryStatus: z.object({
+    body: z.object({
+      status: z.enum(["NEW", "CONTACTED", "INTERESTED", "CONVERTED", "LOST"]),
+      note: optionalString
+    })
+  }),
+  enquiryFollowUp: z.object({
+    body: z.object({
+      note: z.string().min(2),
+      status: optionalString,
+      dueAt: optionalDateString
+    })
+  }),
+  expenseCategory: z.object({
+    body: z.object({
+      name: z.string().min(2),
+      description: optionalString
+    })
+  }),
+  expense: z.object({
+    body: z.object({
+      branchId: z.string().nullable().optional(),
+      categoryId: z.string().max(50).nullable().optional(),
+      vendorId: z.string().max(50).nullable().optional(),
+      title: z.string().trim().min(2).max(200),
+      amount: z.number().positive().max(9999999),
+      expenseDate: requiredDateString,
+      paymentMode: paymentModeEnum.optional(),
+      status: z.enum(["PENDING", "APPROVED", "REJECTED", "PAID"]).optional(),
+      notes: z.string().max(2000).optional(),
+      receiptUrl: z.string().max(2000).optional(),
+      attachmentUrl: z.string().max(2000).optional()
+    })
+  }),
+  expenseApproval: z.object({
+    body: z.object({
+      approvalNote: optionalString
+    })
+  }),
+  attendance: z.object({
+    body: z.object({
+      userSalonId: idSchema,
+      branchId: z.string().nullable().optional(),
+      checkInAt: optionalDateString,
+      checkOutAt: optionalDateString,
+      note: optionalString,
+      attendanceDate: optionalDateString,
+      status: z.enum(["PRESENT", "LATE", "HALF_DAY", "CHECKED_OUT", "ABSENT", "LEAVE", "NOT_CHECKED_IN", "WORKING", "COMPLETED_SHIFT"]).optional(),
+      adminRemark: optionalString,
+      verificationMethod: z.enum(["MANUAL", "SELFIE_GPS", "GPS_ONLY", "BIOMETRIC"]).optional(),
+      geoStatus: z.enum(["INSIDE", "OUTSIDE", "NOT_CAPTURED"]).optional(),
+      checkInLatitude: z.number().min(-90).max(90).optional(),
+      checkInLongitude: z.number().min(-180).max(180).optional(),
+      checkInAccuracyMeters: z.number().min(0).optional(),
+      checkInSelfieUrl: optionalString,
+      checkOutLatitude: z.number().min(-90).max(90).optional(),
+      checkOutLongitude: z.number().min(-180).max(180).optional(),
+      checkOutAccuracyMeters: z.number().min(0).optional(),
+      checkOutSelfieUrl: optionalString
+    })
+  }),
+  attendanceSelfAction: z.object({
+    body: z.object({
+      latitude: z.number().min(-90).max(90),
+      longitude: z.number().min(-180).max(180),
+      accuracyMeters: z.number().min(0),
+      selfieUrl: optionalString,
+      note: optionalString
+    })
+  }),
+  attendanceManualUpdate: z.object({
+    body: z.object({
+      attendanceDate: optionalDateString,
+      checkInAt: optionalDateString,
+      checkOutAt: optionalDateString,
+      status: z.enum(["PRESENT", "LATE", "HALF_DAY", "CHECKED_OUT", "ABSENT", "LEAVE", "NOT_CHECKED_IN", "WORKING", "COMPLETED_SHIFT"]).optional(),
+      adminRemark: optionalString,
+      reason: z.string().min(3),
+      note: optionalString
+    })
+  }),
+  attendanceBiometricEvent: z.object({
+    body: z.object({
+      staffCode: optionalString,
+      biometricUserId: optionalString,
+      userSalonId: optionalString,
+      eventType: z.enum(["CHECK_IN", "CHECK_OUT"]),
+      timestamp: optionalDateString,
+      deviceId: optionalString,
+      deviceLocation: optionalString,
+      verificationConfidence: z.number().optional()
+    })
+  }),
+  attendanceSettings: z.object({
+    body: z.object({
+      officeStartTime: z.string().regex(/^\d{2}:\d{2}$/),
+      officeEndTime: z.string().regex(/^\d{2}:\d{2}$/),
+      lateAfterTime: z.string().regex(/^\d{2}:\d{2}$/),
+      halfDayMinutes: z.number().int().min(30).max(1440),
+      minimumWorkingMinutes: z.number().int().min(30).max(1440),
+      checkoutSelfieRequired: z.boolean().optional(),
+      allowManualAttendanceEdits: z.boolean().optional()
+    })
+  }),
+  leaveRequest: z.object({
+    body: z.object({
+      userSalonId: z.string().optional(),
+      startDate: requiredDateString,
+      endDate: requiredDateString,
+      reason: optionalString,
+      note: optionalString
+    })
+  }),
+  leaveStatus: z.object({
+    body: z.object({
+      note: optionalString
+    })
+  }),
+  campaignTemplate: z.object({
+    body: z.object({
+      name: z.string().min(2),
+      title: z.string().min(2),
+      tier: z.enum(["FREE", "PREMIUM"]).optional(),
+      category: optionalString,
+      backgroundColor: optionalString,
+      textColor: optionalString,
+      offerText: optionalString,
+      logoUrl: optionalString,
+      imageUrl: optionalString,
+      layoutJson: z.any().optional(),
+      isActive: z.boolean().optional()
+    })
+  }),
+  linkCoupon: z.object({
+    body: z.object({
+      couponId: idSchema
+    })
+  }),
+  whatsappSettings: z.object({
+    body: z.object({
+      providerName: optionalString,
+      senderName: optionalString,
+      apiUrl: optionalString,
+      apiKeyPlaceholder: optionalString,
+      automationEnabled: z.boolean().optional(),
+      deliveryStatusEnabled: z.boolean().optional(),
+      readStatusEnabled: z.boolean().optional()
+    })
+  }),
+  whatsappSend: z.object({
+    body: z.object({
+      customerId: z.string().nullable().optional(),
+      campaignId: z.string().nullable().optional(),
+      channel: z.enum(["EMAIL", "WHATSAPP", "SMS"]).optional(),
+      phone: indianPhoneSchema.optional(),
+      email: z.string().email().nullable().optional(),
+      templateType: optionalString,
+      message: z.string().min(2),
+      mediaKind: optionalString,
+      mediaUrl: optionalString
+    }).superRefine((value, ctx) => {
+      const channel = String(value.channel || "EMAIL").toUpperCase();
+      if (channel === "EMAIL") {
+        if (!String(value.email || "").trim()) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["email"],
+            message: "Email is required for email delivery"
+          });
+        }
+        return;
+      }
+
+      if (!String(value.phone || "").trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["phone"],
+          message: "Phone is required for WhatsApp or SMS delivery"
+        });
+      }
+    })
+  }),
+  whatsappAutomation: z.object({
+    body: z.object({
+      eventKey: z.string().min(2),
+      templateType: z.string().min(2),
+      audienceFilter: optionalString,
+      mediaKind: optionalString,
+      mediaUrl: optionalString,
+      isEnabled: z.boolean().optional(),
+      notes: optionalString
+    })
+  }),
+  whatsappLogStatus: z.object({
+    body: z.object({
+      status: z.enum(["SENT", "DELIVERED", "READ", "FAILED", "OPEN_PLACEHOLDER"])
+    })
+  }),
+  whatsappReplyPlaceholder: z.object({
+    body: z.object({
+      replyNote: z.string().min(2)
+    })
+  }),
+  notificationTest: z.object({
+    body: z.object({
+      userSalonId: z.string().nullable().optional(),
+      title: z.string().min(2),
+      message: z.string().min(2),
+      linkUrl: optionalString
+    })
+  }),
+  createReferralCoupon: z.object({
+    body: z.object({
+      branchId: z.string().nullable().optional(),
+      code: z.string().trim().max(50).optional(),
+      title: z.string().trim().min(1).max(200),
+      description: optionalString.nullable(),
+      discountType: z.enum(["PERCENT", "FIXED"]),
+      discountValue: z.coerce.number().min(0).max(999999),
+      minBillAmount: z.coerce.number().min(0).max(9999999).optional().nullable(),
+      usageLimit: z.coerce.number().int().min(0).max(999999).optional().nullable(),
+      customerUsageLimit: z.coerce.number().int().min(0).max(999999).optional().nullable(),
+      startsAt: z.string().optional().nullable(),
+      endsAt: z.string().optional().nullable(),
+      partnerCreditType: z.enum(["PERCENT", "FIXED"]).optional().nullable(),
+      partnerCreditValue: z.coerce.number().min(0).max(999999).optional().nullable(),
+      partnerCustomerId: z.string().optional().nullable(),
+      categoryIds: z.array(z.string()).optional(),
+      serviceIds: z.array(z.string()).optional(),
+      notes: optionalString.nullable(),
+    })
+  }),
+  onboardReferralPartner: z.object({
+    body: z.object({
+      branchId: z.string().nullable().optional(),
+      partnerCustomerId: z.string().optional().nullable(),
+      name: z.string().trim().min(2).max(200).optional(),
+      phone: optionalString,
+      email: optionalEmailLike,
+      title: z.string().trim().max(200).optional(),
+      description: optionalString.nullable(),
+      discountType: z.enum(["PERCENT", "FIXED"]).default("PERCENT"),
+      discountValue: z.coerce.number().min(0).max(999999).default(10),
+      minBillAmount: z.coerce.number().min(0).max(9999999).optional().nullable(),
+      usageLimit: z.coerce.number().int().min(0).max(999999).optional().nullable(),
+      customerUsageLimit: z.coerce.number().int().min(0).max(999999).optional().nullable(),
+      startsAt: z.string().optional().nullable(),
+      endsAt: z.string().optional().nullable(),
+      partnerCreditType: z.enum(["PERCENT", "FIXED"]).default("PERCENT"),
+      partnerCreditValue: z.coerce.number().min(0).max(999999).default(5),
+      categoryIds: z.array(z.string()).optional(),
+      serviceIds: z.array(z.string()).optional(),
+      notes: optionalString.nullable()
+    }).refine((body) => Boolean(body.partnerCustomerId || (body.name && body.phone)), {
+      message: "Select an existing partner or provide partner name and phone"
+    })
+  }),
+  updateReferralCoupon: z.object({
+    params: z.object({ couponId: z.string().min(1) }),
+    body: z.object({
+      code: z.string().trim().min(1).max(50).optional(),
+      title: z.string().trim().min(1).max(200).optional(),
+      description: optionalString.nullable(),
+      discountType: z.enum(["PERCENT", "FIXED"]).optional(),
+      discountValue: z.coerce.number().min(0).max(999999).optional(),
+      minBillAmount: z.coerce.number().min(0).max(9999999).optional().nullable(),
+      usageLimit: z.coerce.number().int().min(0).max(999999).optional().nullable(),
+      customerUsageLimit: z.coerce.number().int().min(0).max(999999).optional().nullable(),
+      startsAt: z.string().optional().nullable(),
+      endsAt: z.string().optional().nullable(),
+      partnerCreditType: z.enum(["PERCENT", "FIXED"]).optional().nullable(),
+      partnerCreditValue: z.coerce.number().min(0).max(999999).optional().nullable(),
+      partnerCustomerId: z.string().optional().nullable(),
+      categoryIds: z.array(z.string()).optional(),
+      serviceIds: z.array(z.string()).optional(),
+      isArchived: z.boolean().optional(),
+      notes: optionalString.nullable(),
+    })
+  })
+};
+

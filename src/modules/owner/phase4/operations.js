@@ -1,0 +1,1761 @@
+import { prisma } from "../../../lib/prisma.js";
+import { createAuditLog, createStaffNotification } from "../../../lib/phase4.js";
+import { buildCsv } from "../../../lib/phase2.js";
+import { requireFeatureEnabled, requireSalonPermission } from "../../../middlewares/rbac.js";
+import { schemas, validate } from "../../../middlewares/validate.js";
+import ExcelJS from "exceljs";
+import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import PDFDocument from "pdfkit";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const INJECTIONS_FILE = path.join(__dirname, "../../../../data/injections.json");
+
+const getInjections = () => {
+  try {
+    if (!fs.existsSync(INJECTIONS_FILE)) {
+      fs.mkdirSync(path.dirname(INJECTIONS_FILE), { recursive: true });
+      fs.writeFileSync(INJECTIONS_FILE, JSON.stringify([]));
+      return [];
+    }
+    const data = fs.readFileSync(INJECTIONS_FILE, "utf8");
+    return JSON.parse(data || "[]");
+  } catch (err) {
+    return [];
+  }
+};
+
+const saveInjections = (injections) => {
+  try {
+    fs.mkdirSync(path.dirname(INJECTIONS_FILE), { recursive: true });
+    fs.writeFileSync(INJECTIONS_FILE, JSON.stringify(injections, null, 2));
+  } catch (err) {
+    // ignore
+  }
+};
+
+const toDate = (value) => (value ? new Date(value) : null);
+const DEFAULT_ATTENDANCE_SETTINGS = {
+  officeStartTime: "09:00",
+  officeEndTime: "18:00",
+  lateAfterTime: "09:15",
+  halfDayMinutes: 240,
+  minimumWorkingMinutes: 480,
+  overtimeEnabled: false,
+  overtimeThresholdMinutes: 480,
+  checkoutSelfieRequired: false,
+  allowManualAttendanceEdits: true
+};
+const startOfAttendanceDay = (value = new Date()) => {
+  const date = new Date(value);
+  date.setHours(0, 0, 0, 0);
+  return date;
+};
+const endOfAttendanceDay = (value = new Date()) => {
+  const date = startOfAttendanceDay(value);
+  date.setDate(date.getDate() + 1);
+  return date;
+};
+const parseTimeOnDate = (dateValue, timeValue) => {
+  const base = startOfAttendanceDay(dateValue);
+  const [hours, minutes] = String(timeValue || "00:00").split(":").map((part) => Number(part || 0));
+  base.setHours(hours, minutes, 0, 0);
+  return base;
+};
+const roundMinutesDiff = (startAt, endAt) => Math.max(0, Math.round((new Date(endAt).getTime() - new Date(startAt).getTime()) / 60000));
+const toDecimalNumber = (value) => value == null ? null : parseFloat(String(value));
+const haversineDistanceMeters = (lat1, lon1, lat2, lon2) => {
+  const toRadians = (value) => (value * Math.PI) / 180;
+  const earthRadius = 6371000;
+  const dLat = toRadians(lat2 - lat1);
+  const dLon = toRadians(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(dLon / 2) ** 2;
+  return earthRadius * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
+const mergeAttendanceSettings = (rawSettings) => ({
+  ...DEFAULT_ATTENDANCE_SETTINGS,
+  ...(rawSettings && typeof rawSettings === "object" ? rawSettings : {})
+});
+const getAttendanceSettings = async (salonId) => {
+  const row = await prisma.salonSetting.findFirst({ where: { salonId, branchId: null } });
+  return mergeAttendanceSettings(row?.advancedSettings?.attendanceSettings);
+};
+const extractBranchOpeningTime = (branch, settings) => {
+  if (branch?.businessHours) {
+    const match = String(branch.businessHours).match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+    if (match) {
+      let h = parseInt(match[1], 10);
+      const m = parseInt(match[2], 10);
+      const ampm = match[3] ? match[3].toUpperCase() : null;
+      if (ampm === "PM" && h < 12) h += 12;
+      if (ampm === "AM" && h === 12) h = 0;
+      // 15 minutes grace period
+      const totalMinutes = h * 60 + m + 15;
+      const graceH = Math.floor(totalMinutes / 60) % 24;
+      const graceM = totalMinutes % 60;
+      return `${String(graceH).padStart(2, "0")}:${String(graceM).padStart(2, "0")}`;
+    }
+  }
+  return settings?.lateAfterTime || "09:15";
+};
+
+const resolveAttendanceStatus = ({ attendanceDate, checkInAt, checkOutAt, workedMinutes, settings, branch }) => {
+  if (!checkInAt) return "NOT_CHECKED_IN";
+  const lateTimeStr = extractBranchOpeningTime(branch, settings);
+  const lateAfter = parseTimeOnDate(attendanceDate, lateTimeStr);
+  const isLate = new Date(checkInAt) > lateAfter;
+
+  if (!checkOutAt) {
+    return isLate ? "LATE" : "PRESENT";
+  }
+  const halfDayThreshold = Number(settings?.halfDayMinutes || DEFAULT_ATTENDANCE_SETTINGS.halfDayMinutes);
+  if (workedMinutes != null && workedMinutes < halfDayThreshold) return "HALF_DAY";
+  if (isLate) return "LATE";
+  return "CHECKED_OUT";
+};
+
+const validateGeofence = ({ branch, latitude, longitude }) => {
+  const branchLatitude = toDecimalNumber(branch?.latitude);
+  const branchLongitude = toDecimalNumber(branch?.longitude);
+  const radius = Number(branch?.geofenceRadiusMeters || 200);
+  if (branchLatitude == null || branchLongitude == null || (Number(branchLatitude) === 0 && Number(branchLongitude) === 0)) {
+    return { distance: 0, geoStatus: "SKIPPED" };
+  }
+  const distance = haversineDistanceMeters(branchLatitude, branchLongitude, Number(latitude), Number(longitude));
+  return {
+    distance,
+    geoStatus: distance <= radius ? "INSIDE" : "OUTSIDE"
+  };
+};
+const addDays = (value, days) => {
+  const date = new Date(value);
+  date.setDate(date.getDate() + days);
+  return date;
+};
+const getPeriodWindow = (period, referenceDate = new Date()) => {
+  const anchor = startOfAttendanceDay(referenceDate);
+  if (period === "weekly") {
+    const start = new Date(anchor);
+    const day = start.getDay();
+    const diffToMonday = day === 0 ? -6 : 1 - day;
+    start.setDate(start.getDate() + diffToMonday);
+    return { start, end: addDays(start, 7), label: "Weekly" };
+  }
+  if (period === "monthly") {
+    const start = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
+    const end = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 1);
+    return { start, end, label: "Monthly" };
+  }
+  return { start: anchor, end: addDays(anchor, 1), label: "Daily" };
+};
+const formatDateLabel = (value) => new Date(value).toLocaleDateString("en-GB");
+const formatDateTimeLabel = (value) => value ? new Date(value).toLocaleString("en-GB") : "-";
+const formatWorkedHours = (minutes) => {
+  if (minutes == null) return "-";
+  const hrs = Math.floor(Number(minutes) / 60);
+  const mins = Number(minutes) % 60;
+  return `${hrs}h ${mins}m`;
+};
+const toYmd = (value) => {
+  const d = new Date(value);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+const buildAttendanceReportDataset = async ({ salonId, branchId, period, referenceDate }) => {
+  const { start, end, label } = getPeriodWindow(period, referenceDate);
+  const [staffRows, attendanceRows, leaveRows] = await Promise.all([
+    prisma.userSalon.findMany({
+      where: {
+        salonId,
+        isArchived: false,
+        ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+        user: { isActive: true }
+      },
+      include: { user: true, branch: true },
+      orderBy: { id: "asc" }
+    }),
+    prisma.attendanceRecord.findMany({
+      where: {
+        salonId,
+        ...(branchId ? { branchId } : {}),
+        attendanceDate: { gte: start, lt: end }
+      },
+      include: { userSalon: { include: { user: true, branch: true } }, branch: true },
+      orderBy: [{ attendanceDate: "asc" }, { checkInAt: "asc" }]
+    }),
+    prisma.leaveRequest.findMany({
+      where: {
+        salonId,
+        status: "APPROVED",
+        startDate: { lt: end },
+        endDate: { gte: start }
+      }
+    })
+  ]);
+
+  const attendanceMap = new Map(
+    attendanceRows.map((row) => {
+      const dayKey = toYmd(row.attendanceDate);
+      return [`${row.userSalonId}:${dayKey}`, row];
+    })
+  );
+  const leaveSet = new Set();
+  leaveRows.forEach((row) => {
+    for (let cursor = startOfAttendanceDay(row.startDate); cursor < end; cursor = addDays(cursor, 1)) {
+      if (cursor >= startOfAttendanceDay(start) && cursor >= startOfAttendanceDay(row.startDate) && cursor <= startOfAttendanceDay(row.endDate)) {
+        leaveSet.add(`${row.userSalonId}:${toYmd(cursor)}`);
+      }
+    }
+  });
+
+  const rows = [];
+  for (let cursor = new Date(start); cursor < end; cursor = addDays(cursor, 1)) {
+    const dayKey = toYmd(cursor);
+    for (const staff of staffRows) {
+      const attendanceRow = attendanceMap.get(`${staff.id}:${dayKey}`) || null;
+      const leaveKey = `${staff.id}:${dayKey}`;
+      if (attendanceRow) {
+        rows.push({
+          date: new Date(cursor),
+          staffName: attendanceRow.userSalon?.user?.name || staff.user?.name || staff.id,
+          staffCode: staff.id,
+          branchName: attendanceRow.branch?.name || staff.branch?.name || "",
+          status: attendanceRow.status,
+          checkInAt: attendanceRow.checkInAt,
+          checkOutAt: attendanceRow.checkOutAt,
+          workedMinutes: attendanceRow.workedMinutes,
+          workedHours: formatWorkedHours(attendanceRow.workedMinutes),
+          geoStatus: attendanceRow.geoStatus,
+          verificationMethod: attendanceRow.verificationMethod,
+          gpsLocation: attendanceRow.checkInLatitude != null && attendanceRow.checkInLongitude != null
+            ? `${attendanceRow.checkInLatitude}, ${attendanceRow.checkInLongitude}`
+            : "-",
+          selfie: attendanceRow.checkInSelfieUrl || attendanceRow.checkOutSelfieUrl || "",
+          adminRemark: attendanceRow.adminRemark || "",
+          note: attendanceRow.note || ""
+        });
+      } else if (leaveSet.has(leaveKey)) {
+        rows.push({
+          date: new Date(cursor),
+          staffName: staff.user?.name || staff.id,
+          staffCode: staff.id,
+          branchName: staff.branch?.name || "",
+          status: "LEAVE",
+          checkInAt: null,
+          checkOutAt: null,
+          workedMinutes: 0,
+          workedHours: "0h 0m",
+          geoStatus: "NOT_CAPTURED",
+          verificationMethod: "MANUAL",
+          gpsLocation: "-",
+          selfie: "",
+          adminRemark: "",
+          note: "Approved leave"
+        });
+      } else {
+        rows.push({
+          date: new Date(cursor),
+          staffName: staff.user?.name || staff.id,
+          staffCode: staff.id,
+          branchName: staff.branch?.name || "",
+          status: "ABSENT",
+          checkInAt: null,
+          checkOutAt: null,
+          workedMinutes: 0,
+          workedHours: "0h 0m",
+          geoStatus: "NOT_CAPTURED",
+          verificationMethod: "MANUAL",
+          gpsLocation: "-",
+          selfie: "",
+          adminRemark: "",
+          note: ""
+        });
+      }
+    }
+  }
+
+  const statusSummary = rows.reduce((acc, row) => {
+    acc[row.status] = (acc[row.status] || 0) + 1;
+    return acc;
+  }, {});
+
+  return {
+    period,
+    label,
+    start,
+    end,
+    rows,
+    summary: {
+      totalRows: rows.length,
+      totalStaff: staffRows.length,
+      present: rows.filter((row) => ["PRESENT", "LATE", "HALF_DAY", "COMPLETED_SHIFT", "WORKING"].includes(row.status)).length,
+      absent: statusSummary.ABSENT || 0,
+      leave: statusSummary.LEAVE || 0,
+      late: statusSummary.LATE || 0,
+      halfDay: statusSummary.HALF_DAY || 0,
+      completedShift: statusSummary.COMPLETED_SHIFT || 0,
+      working: statusSummary.WORKING || 0
+    }
+  };
+};
+const buildAttendanceExportRows = (rows) => rows.map((row, index) => ({
+  "SR. NO.": index + 1,
+  DATE: formatDateLabel(row.date),
+  STAFF: row.staffName,
+  "STAFF ID": row.staffCode,
+  BRANCH: row.branchName || "-",
+  STATUS: row.status,
+  "CHECK-IN": formatDateTimeLabel(row.checkInAt),
+  "CHECK-OUT": formatDateTimeLabel(row.checkOutAt),
+  "WORKING HOURS": row.workedHours,
+  "GEO STATUS": row.geoStatus,
+  "VERIFICATION": row.verificationMethod,
+  "GPS LOCATION": row.gpsLocation,
+  SELFIE: row.selfie || "-",
+  REMARK: row.adminRemark || "-",
+  NOTE: row.note || "-"
+}));
+
+export const registerOperationsRoutes = (ownerRouter) => {
+  ownerRouter.get("/operations/global-dashboard", requireSalonPermission("dashboard", "view"), async (req, res) => {
+    const { startDate, endDate, branchId } = req.query;
+    const dateFilter = {};
+    if (startDate && endDate) {
+      dateFilter.createdAt = {
+        gte: new Date(startDate),
+        lte: new Date(endDate + "T23:59:59.999Z")
+      };
+    }
+
+    const branchFilter = branchId ? { id: branchId } : {};
+    const branches = await prisma.branch.findMany({ where: { salonId: req.salonId, isActive: true, ...branchFilter } });
+    const invoices = await prisma.invoice.findMany({
+      where: {
+        salonId: req.salonId,
+        status: "PAID",
+        ...(branchId ? { branchId } : {}),
+        ...dateFilter
+      },
+      select: { total: true, branchId: true }
+    });
+    const appointments = await prisma.appointment.count({
+      where: {
+        salonId: req.salonId,
+        status: { not: "CANCELLED" },
+        ...(branchId ? { branchId } : {}),
+        ...dateFilter
+      }
+    });
+    const customers = await prisma.customer.count({ where: { salonId: req.salonId, ...dateFilter } });
+
+    const todayStart = startOfAttendanceDay(new Date());
+    const todayEnd = endOfAttendanceDay(todayStart);
+    const [allStaff, todayAttendanceRecords, todayLeaves] = await Promise.all([
+      prisma.userSalon.findMany({
+        where: {
+          salonId: req.salonId,
+          isArchived: false,
+          ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+          user: { isActive: true }
+        },
+        select: { id: true, branchId: true }
+      }),
+      prisma.attendanceRecord.findMany({
+        where: {
+          salonId: req.salonId,
+          ...(branchId ? { branchId } : {}),
+          attendanceDate: { gte: todayStart, lt: todayEnd }
+        }
+      }),
+      prisma.leaveRequest.findMany({
+        where: {
+          salonId: req.salonId,
+          status: "APPROVED",
+          startDate: { lt: todayEnd },
+          endDate: { gte: todayStart }
+        }
+      })
+    ]);
+
+    const leaveStaffIds = new Set(todayLeaves.map((l) => l.userSalonId));
+    const totalStaffCount = allStaff.length;
+    const presentCount = todayAttendanceRecords.filter((r) => ["PRESENT", "WORKING", "CHECKED_OUT"].includes(r.status)).length;
+    const lateCount = todayAttendanceRecords.filter((r) => r.status === "LATE").length;
+    const onLeaveCount = leaveStaffIds.size;
+    const absentCount = todayAttendanceRecords.filter((r) => r.status === "ABSENT").length;
+    const attendingTotal = presentCount + lateCount;
+    const attendancePct = totalStaffCount > 0
+      ? Math.min(100, Math.round((attendingTotal / Math.max(1, totalStaffCount - onLeaveCount)) * 100))
+      : 0;
+
+    const totalRevenue = invoices.reduce((sum, inv) => sum + Number(inv.total || 0), 0);
+    const branchPerformance = branches.map((b) => {
+      const branchInvoices = invoices.filter((inv) => inv.branchId === b.id);
+      const rev = branchInvoices.reduce((sum, inv) => sum + Number(inv.total || 0), 0);
+      const branchStaff = allStaff.filter((s) => s.branchId === b.id);
+      const branchAtt = todayAttendanceRecords.filter((r) => r.branchId === b.id);
+      const bPresent = branchAtt.filter((r) => ["PRESENT", "WORKING", "CHECKED_OUT"].includes(r.status)).length;
+      const bLate = branchAtt.filter((r) => r.status === "LATE").length;
+      return {
+        id: b.id,
+        name: b.name,
+        city: b.city || "Location",
+        revenue: rev,
+        appointments: 0,
+        growth: "+0%",
+        staffCount: branchStaff.length,
+        presentStaff: bPresent,
+        lateStaff: bLate,
+        rating: 4.8,
+        status: rev > 1000 ? "TOP PERFORMER" : "STEADY"
+      };
+    });
+
+    res.json({
+      totalRevenue,
+      totalAppointments: appointments,
+      totalCustomers: customers,
+      activeBranchesCount: branches.length,
+      revenueGrowth: "+0%",
+      appointmentGrowth: "+0%",
+      branchPerformance,
+      attendance: {
+        totalStaff: totalStaffCount,
+        present: presentCount,
+        late: lateCount,
+        onLeave: onLeaveCount,
+        absent: absentCount,
+        attendancePercentage: attendancePct
+      },
+      growthTrends: [
+        { month: "Prev", revenue: totalRevenue * 0.8, appointments: appointments * 0.8 },
+        { month: "Curr", revenue: totalRevenue, appointments }
+      ]
+    });
+  });
+
+  ownerRouter.get("/expense-categories", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "view"), async (req, res) => {
+    let categories = await prisma.expenseCategory.findMany({ where: { salonId: req.salonId }, orderBy: { name: "asc" } });
+    
+    if (categories.length === 0) {
+      const defaults = [
+         { name: "Rent", description: "PNL:Operating Expenses|ACTIVE:true|Monthly salon rent" },
+         { name: "Utilities", description: "PNL:Operating Expenses|ACTIVE:true|Electricity, water, internet" },
+         { name: "Inventory & Products", description: "PNL:Cost of Sales|ACTIVE:true|Shampoos, colors, professional products" },
+         { name: "Staff Payroll", description: "PNL:Payroll|ACTIVE:true|Salaries and wages" },
+         { name: "Staff Commission", description: "PNL:Payroll|ACTIVE:true|Commissions paid to staff" },
+         { name: "Marketing & Ads", description: "PNL:Operating Expenses|ACTIVE:true|Social media ads, flyers, promotions" },
+         { name: "Maintenance & Repairs", description: "PNL:Operating Expenses|ACTIVE:true|AC repair, plumbing, salon maintenance" },
+         { name: "Software & IT", description: "PNL:Operating Expenses|ACTIVE:true|Software subscriptions" },
+         { name: "Refreshments", description: "PNL:Operating Expenses|ACTIVE:true|Coffee, tea, water for clients and staff" },
+         { name: "Taxes & Licenses", description: "PNL:Operating Expenses|ACTIVE:true|Government taxes, business licenses" },
+         { name: "Cleaning Services", description: "PNL:Operating Expenses|ACTIVE:true|Daily cleaning, deep cleaning, pest control" },
+         { name: "Office Supplies", description: "PNL:Operating Expenses|ACTIVE:true|Stationery, receipt paper, printer ink" },
+         { name: "Insurance", description: "PNL:Operating Expenses|ACTIVE:true|Business liability, property insurance" },
+         { name: "Legal & Accounting", description: "PNL:Operating Expenses|ACTIVE:true|CA fees, legal consultation" },
+         { name: "Miscellaneous", description: "PNL:Operating Expenses|ACTIVE:true|Other general expenses" }
+      ];
+      await prisma.expenseCategory.createMany({
+         data: defaults.map(d => ({ ...d, salonId: req.salonId }))
+      });
+      categories = await prisma.expenseCategory.findMany({ where: { salonId: req.salonId }, orderBy: { name: "asc" } });
+    }
+    
+    res.json(categories);
+  });
+  ownerRouter.post("/expense-categories", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "create"), validate(schemas.expenseCategory), async (req, res) => {
+    res.status(201).json(await prisma.expenseCategory.create({ data: { salonId: req.salonId, name: req.body.name, description: req.body.description || null } }));
+  });
+  ownerRouter.patch("/expense-categories/:id", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "edit"), validate(schemas.expenseCategory), async (req, res) => {
+    const row = await prisma.expenseCategory.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+    if (!row) return res.status(404).json({ message: "Expense category not found" });
+    res.json(await prisma.expenseCategory.update({ where: { id: row.id }, data: { name: req.body.name, description: req.body.description || null } }));
+  });
+  ownerRouter.delete("/expense-categories/:id", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "edit"), async (req, res) => {
+    const row = await prisma.expenseCategory.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+    if (!row) return res.status(404).json({ message: "Expense category not found" });
+    await prisma.expenseCategory.delete({ where: { id: row.id } });
+    res.json({ message: "Expense category deleted" });
+  });
+
+  ownerRouter.get("/expenses", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "view"), async (req, res) => {
+    const q = String(req.query.q || "").trim();
+    const status = String(req.query.status || "").trim();
+    const branchId = req.query.branchId ? String(req.query.branchId) : null;
+    res.json(await prisma.expense.findMany({
+      where: {
+        salonId: req.salonId,
+        ...(status ? { status } : {}),
+        ...(branchId ? { branchId } : {}),
+        ...(q ? {
+          OR: [
+            { title: { contains: q, mode: "insensitive" } },
+            { notes: { contains: q, mode: "insensitive" } }
+          ]
+        } : {})
+      },
+      include: { branch: true, category: true, vendor: true, createdByMembership: { include: { user: true } }, approvedByMembership: { include: { user: true } } },
+      orderBy: { expenseDate: "desc" }
+    }));
+  });
+  ownerRouter.post("/expenses", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "create"), validate(schemas.expense), async (req, res) => {
+    const row = await prisma.expense.create({
+      data: {
+        salonId: req.salonId,
+        branchId: req.body.branchId || null,
+        categoryId: req.body.categoryId || null,
+        vendorId: req.body.vendorId || null,
+        createdByMembershipId: req.user.membershipId || null,
+        title: req.body.title,
+        amount: req.body.amount,
+        expenseDate: new Date(req.body.expenseDate),
+        paymentMode: req.body.paymentMode || null,
+        status: req.body.status || (req.user?.salonRole === "SALON_OWNER" ? "APPROVED" : "PENDING"),
+        notes: req.body.notes || null,
+        receiptUrl: req.body.receiptUrl || null,
+        attachmentUrl: req.body.attachmentUrl || null
+      }
+    });
+    res.status(201).json(row);
+  });
+
+  ownerRouter.get("/expenses/reports", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "view"), async (req, res) => {
+    const branchId = req.query.branchId ? String(req.query.branchId) : null;
+    const rows = await prisma.expense.findMany({ where: { salonId: req.salonId, ...(branchId ? { branchId } : {}) }, include: { category: true, branch: true }, orderBy: { expenseDate: "desc" } });
+    res.json({
+      total: rows.reduce((sum, row) => sum + Number(row.amount || 0), 0),
+      approved: rows.filter((row) => row.status === "APPROVED" || row.status === "PAID"),
+      rows
+    });
+  });
+
+  ownerRouter.get("/expenses/accounts", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "view"), async (req, res) => {
+    const injections = getInjections().filter(inj => inj.salonId === req.salonId);
+    res.json({ injections });
+  });
+
+  ownerRouter.post("/expenses/accounts/injections", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "create"), async (req, res) => {
+    const { accountMode, paymentMode, amount, note } = req.body || {};
+    if (!accountMode || !["CASH", "BANK", "WALLET"].includes(String(accountMode))) {
+      return res.status(400).json({ message: "accountMode must be CASH, BANK, or WALLET" });
+    }
+    if (!paymentMode || !["CASH", "CARD", "UPI", "BANK_TRANSFER", "WALLET", "ONLINE"].includes(String(paymentMode))) {
+      return res.status(400).json({ message: "Invalid paymentMode" });
+    }
+    const numAmount = Number(amount);
+    if (!Number.isFinite(numAmount) || numAmount <= 0 || numAmount > 9999999) {
+      return res.status(400).json({ message: "Amount must be a positive number (max 9999999)" });
+    }
+    const sanitizedNote = String(note || "").trim().slice(0, 500);
+    const injections = getInjections();
+    const newInjection = {
+      id: "inj-" + crypto.randomUUID(),
+      salonId: req.salonId,
+      accountMode: String(accountMode),
+      paymentMode: String(paymentMode),
+      amount: numAmount,
+      note: sanitizedNote,
+      createdAt: new Date().toISOString()
+    };
+    injections.push(newInjection);
+    saveInjections(injections);
+    res.status(201).json(newInjection);
+  });
+
+  ownerRouter.get("/expenses/:id", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "view"), async (req, res) => {
+    const row = await prisma.expense.findFirst({ where: { id: req.params.id, salonId: req.salonId }, include: { branch: true, category: true, vendor: true } });
+    if (!row) return res.status(404).json({ message: "Expense not found" });
+    res.json(row);
+  });
+  ownerRouter.patch("/expenses/:id", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "edit"), validate(schemas.expense), async (req, res) => {
+    const row = await prisma.expense.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+    if (!row) return res.status(404).json({ message: "Expense not found" });
+    res.json(await prisma.expense.update({
+      where: { id: row.id },
+      data: {
+        branchId: req.body.branchId || null,
+        categoryId: req.body.categoryId || null,
+        vendorId: req.body.vendorId || null,
+        title: req.body.title,
+        amount: req.body.amount,
+        expenseDate: new Date(req.body.expenseDate),
+        paymentMode: req.body.paymentMode || null,
+        status: req.body.status || row.status,
+        notes: req.body.notes || null,
+        receiptUrl: req.body.receiptUrl || null,
+        attachmentUrl: req.body.attachmentUrl || null
+      }
+    }));
+  });
+  ownerRouter.patch("/expenses/:id/approve", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "approve"), validate(schemas.expenseApproval), async (req, res) => {
+    const row = await prisma.expense.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+    if (!row) return res.status(404).json({ message: "Expense not found" });
+    const updated = await prisma.expense.update({
+      where: { id: row.id },
+      data: { status: "APPROVED", approvalNote: req.body.approvalNote || null, approvedByMembershipId: req.user.membershipId || null }
+    });
+    await createAuditLog({ salonId: req.salonId, actorUserId: req.user.userId, actorMembershipId: req.user.membershipId, module: "EXPENSES", action: "APPROVED", entityType: "Expense", entityId: updated.id, summary: `Expense ${updated.title} approved` });
+    res.json(updated);
+  });
+  ownerRouter.patch("/expenses/:id/reject", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "approve"), validate(schemas.expenseApproval), async (req, res) => {
+    const row = await prisma.expense.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+    if (!row) return res.status(404).json({ message: "Expense not found" });
+    res.json(await prisma.expense.update({ where: { id: row.id }, data: { status: "REJECTED", approvalNote: req.body.approvalNote || null, approvedByMembershipId: req.user.membershipId || null } }));
+  });
+
+  ownerRouter.delete("/expenses/:id", requireFeatureEnabled("expenses"), requireSalonPermission("expenses", "edit"), async (req, res) => {
+    const row = await prisma.expense.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+    if (!row) return res.status(404).json({ message: "Expense not found" });
+    await prisma.expense.delete({ where: { id: row.id } });
+    await createAuditLog({ salonId: req.salonId, actorUserId: req.user.userId, actorMembershipId: req.user.membershipId, module: "EXPENSES", action: "EXPENSE_DELETED", entityType: "Expense", entityId: row.id, summary: `Expense "${row.title}" (₹${row.amount}) deleted` });
+    res.json({ message: "Expense deleted" });
+  });
+
+  ownerRouter.get("/attendance", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "view"), async (req, res) => {
+    const q = String(req.query.q || "").trim();
+    const branchId = req.query.branchId ? String(req.query.branchId) : null;
+    const status = String(req.query.status || "").trim();
+    const date = String(req.query.date || "").trim();
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const skip = (page - 1) * limit;
+    const where = {
+      salonId: req.salonId,
+      ...(branchId ? { branchId } : {}),
+      ...(status ? { status } : {}),
+      ...(date ? { attendanceDate: { gte: startOfAttendanceDay(date), lt: endOfAttendanceDay(date) } } : {}),
+      ...(q ? { userSalon: { is: { user: { is: { name: { contains: q, mode: "insensitive" } } } } } } : {})
+    };
+    const [rows, total] = await Promise.all([
+      prisma.attendanceRecord.findMany({
+        where,
+        include: { userSalon: { include: { user: true } }, branch: true },
+        orderBy: [{ attendanceDate: "desc" }, { checkInAt: "desc" }],
+        skip,
+        take: limit
+      }),
+      prisma.attendanceRecord.count({ where })
+    ]);
+    res.json({ rows, total, page, limit, totalPages: Math.ceil(total / limit) });
+  });
+  ownerRouter.get("/attendance/settings", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "view"), async (req, res) => {
+    res.json(await getAttendanceSettings(req.salonId));
+  });
+  ownerRouter.post("/attendance/settings", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "edit"), validate(schemas.attendanceSettings), async (req, res) => {
+    const existing = await prisma.salonSetting.findFirst({ where: { salonId: req.salonId, branchId: null } });
+    const advancedSettings = {
+      ...(existing?.advancedSettings || {}),
+      attendanceSettings: {
+        ...mergeAttendanceSettings(existing?.advancedSettings?.attendanceSettings),
+        ...req.body
+      }
+    };
+    const row = existing
+      ? await prisma.salonSetting.update({ where: { id: existing.id }, data: { advancedSettings } })
+      : await prisma.salonSetting.create({ data: { salonId: req.salonId, branchId: null, advancedSettings } });
+    await createAuditLog({
+      salonId: req.salonId,
+      actorUserId: req.user.userId,
+      actorMembershipId: req.user.membershipId,
+      module: "ATTENDANCE",
+      action: "SETTINGS_UPDATED",
+      entityType: "SalonSetting",
+      entityId: row.id,
+      summary: "Attendance settings updated",
+      metadata: { attendanceSettings: advancedSettings.attendanceSettings }
+    });
+    res.status(201).json(advancedSettings.attendanceSettings);
+  });
+  ownerRouter.get("/attendance/summary", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "view"), async (req, res) => {
+    try {
+      const targetDate = startOfAttendanceDay(req.query.date || new Date());
+      const targetEnd = endOfAttendanceDay(targetDate);
+      const branchId = req.query.branchId ? String(req.query.branchId) : null;
+      const staffBranchFilter = branchId ? { OR: [{ branchId }, { branchId: null }] } : {};
+      
+      const allStaff = await prisma.userSalon.findMany({
+        where: { salonId: req.salonId, isArchived: false, ...staffBranchFilter, user: { isActive: true } },
+        include: { user: true }
+      });
+      const staffIds = allStaff.map((row) => row.id);
+
+      const [records, leaves] = await Promise.all([
+        prisma.attendanceRecord.findMany({
+          where: { salonId: req.salonId, userSalonId: { in: staffIds }, attendanceDate: { gte: targetDate, lt: targetEnd } }
+        }),
+        prisma.leaveRequest.findMany({
+          where: {
+            salonId: req.salonId,
+            userSalonId: { in: staffIds },
+            status: "APPROVED",
+            startDate: { lt: targetEnd },
+            endDate: { gte: targetDate }
+          }
+        })
+      ]);
+      const leaveSet = new Set(leaves.map((row) => row.userSalonId));
+      const recordMap = new Map(records.map((row) => [row.userSalonId, row]));
+      const isToday = targetDate.getTime() === startOfAttendanceDay(new Date()).getTime();
+      const unrecordedStaff = allStaff.filter((row) => !leaveSet.has(row.id) && !recordMap.has(row.id));
+      const explicitAbsent = records.filter((row) => row.status === "ABSENT").length;
+      const absentToday = isToday ? explicitAbsent : (explicitAbsent + unrecordedStaff.length);
+      const notCheckedIn = isToday ? unrecordedStaff.length : 0;
+      const presentCount = records.filter((row) => ["PRESENT", "WORKING"].includes(row.status)).length;
+      const lateCount = records.filter((row) => row.status === "LATE").length;
+      const checkedOutCount = records.filter((row) => row.status === "CHECKED_OUT" || (Boolean(row.checkOutAt) && !["LATE", "ABSENT", "LEAVE"].includes(row.status))).length;
+      const onLeaveCount = leaveSet.size;
+      const activeAttending = presentCount + lateCount + checkedOutCount;
+      const attendancePercentage = allStaff.length > 0
+        ? Math.min(100, Math.round((activeAttending / Math.max(1, allStaff.length - onLeaveCount)) * 100))
+        : 0;
+
+      res.json({
+        totalStaff: allStaff.length,
+        presentToday: presentCount,
+        lateStaff: lateCount,
+        checkedOut: checkedOutCount,
+        absentToday,
+        notCheckedIn,
+        currentlyWorking: records.filter((row) => !row.checkOutAt && row.status !== "LEAVE" && row.status !== "ABSENT").length,
+        completedShift: checkedOutCount,
+        onLeave: onLeaveCount,
+        attendancePercentage
+      });
+    } catch (err) {
+      console.error("attendance summary error:", err);
+      res.json({ totalStaff: 0, presentToday: 0, absentToday: 0, lateStaff: 0, checkedOut: 0, notCheckedIn: 0, currentlyWorking: 0, completedShift: 0, onLeave: 0, attendancePercentage: 0 });
+    }
+  });
+
+  ownerRouter.get("/attendance/day-sheet", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "view"), async (req, res) => {
+    try {
+      const targetDate = startOfAttendanceDay(req.query.date || new Date());
+      if (isNaN(targetDate.getTime())) return res.json({ date: new Date(), rows: [] });
+      const targetEnd = endOfAttendanceDay(targetDate);
+      const branchId = req.query.branchId ? String(req.query.branchId) : null;
+      const staffRows = await prisma.userSalon.findMany({
+        where: {
+          salonId: req.salonId,
+          isArchived: false,
+          ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+          user: { isActive: true }
+        },
+        include: { user: true, branch: true },
+        orderBy: { id: "asc" }
+      });
+      const staffIds = staffRows.map((s) => s.id);
+      const attendanceRows = await prisma.attendanceRecord.findMany({
+        where: {
+          salonId: req.salonId,
+          userSalonId: { in: staffIds },
+          attendanceDate: { gte: targetDate, lt: targetEnd }
+        },
+        include: { branch: true }
+      });
+      const leaveRows = await prisma.leaveRequest.findMany({
+        where: {
+          salonId: req.salonId,
+          userSalonId: { in: staffIds },
+          status: "APPROVED",
+          startDate: { lt: targetEnd },
+          endDate: { gte: targetDate }
+        }
+      });
+      const attendanceMap = new Map(attendanceRows.map((row) => [row.userSalonId, row]));
+      const leaveSet = new Set(leaveRows.map((row) => row.userSalonId));
+      const isToday = targetDate.getTime() === startOfAttendanceDay(new Date()).getTime();
+
+      const rows = staffRows.map((staff) => {
+        const attendanceRow = attendanceMap.get(staff.id) || null;
+        if (attendanceRow) {
+          let displayStatus = attendanceRow.status;
+          if (attendanceRow.checkOutAt && (displayStatus === "WORKING" || displayStatus === "COMPLETED_SHIFT")) {
+            displayStatus = "CHECKED_OUT";
+          }
+          return {
+            type: "ATTENDANCE",
+            userSalonId: staff.id,
+            staffName: staff.user?.name || staff.id,
+            branchId: attendanceRow.branchId || staff.branchId || null,
+            branchName: attendanceRow.branch?.name || staff.branch?.name || "",
+            status: displayStatus,
+            checkInAt: attendanceRow.checkInAt,
+            checkOutAt: attendanceRow.checkOutAt,
+            workedMinutes: attendanceRow.workedMinutes,
+            attendanceId: attendanceRow.id
+          };
+        }
+        if (leaveSet.has(staff.id)) {
+          return {
+            type: "LEAVE",
+            userSalonId: staff.id,
+            staffName: staff.user?.name || staff.id,
+            branchId: staff.branchId || null,
+            branchName: staff.branch?.name || "",
+            status: "LEAVE",
+            checkInAt: null,
+            checkOutAt: null,
+            workedMinutes: null,
+            attendanceId: null
+          };
+        }
+        return {
+          type: isToday ? "NOT_CHECKED_IN" : "ABSENT",
+          userSalonId: staff.id,
+          staffName: staff.user?.name || staff.id,
+          branchId: staff.branchId || null,
+          branchName: staff.branch?.name || "",
+          status: isToday ? "NOT_CHECKED_IN" : "ABSENT",
+          checkInAt: null,
+          checkOutAt: null,
+          workedMinutes: null,
+          attendanceId: null
+        };
+      });
+      res.json({ date: targetDate, rows });
+    } catch (err) {
+      console.error("day-sheet error:", err);
+      res.json({ date: new Date(), rows: [] });
+    }
+  });
+
+  ownerRouter.get("/attendance/reports", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "view"), async (req, res) => {
+    try {
+    const period = ["daily", "weekly", "monthly"].includes(String(req.query.period || "").toLowerCase())
+      ? String(req.query.period).toLowerCase()
+      : "daily";
+    const branchId = req.query.branchId ? String(req.query.branchId) : null;
+    const refDate = req.query.date || new Date();
+    if (isNaN(new Date(refDate).getTime())) return res.json({ period, rows: [], summary: {} });
+    res.json(await buildAttendanceReportDataset({
+      salonId: req.salonId,
+      branchId,
+      period,
+      referenceDate: refDate
+    }));
+    } catch (err) {
+      console.error("attendance/reports error:", err.message, err.stack);
+      res.json({ period: req.query.period || "daily", rows: [], summary: {} });
+    }
+  });
+  ownerRouter.get("/attendance/reports/export.xlsx", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "view"), async (req, res) => {
+    try {
+    const period = ["daily", "weekly", "monthly"].includes(String(req.query.period || "").toLowerCase())
+      ? String(req.query.period).toLowerCase()
+      : "daily";
+    const branchId = req.query.branchId ? String(req.query.branchId) : null;
+    const report = await buildAttendanceReportDataset({
+      salonId: req.salonId,
+      branchId,
+      period,
+      referenceDate: req.query.date || new Date()
+    });
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Attendance Report");
+    const exportRows = buildAttendanceExportRows(report.rows);
+    worksheet.columns = Object.keys(exportRows[0] || {
+      "SR. NO.": "",
+      DATE: "",
+      STAFF: "",
+      "STAFF ID": "",
+      BRANCH: "",
+      STATUS: "",
+      "CHECK-IN": "",
+      "CHECK-OUT": "",
+      "WORKING HOURS": "",
+      "GEO STATUS": "",
+      VERIFICATION: "",
+      "GPS LOCATION": "",
+      SELFIE: "",
+      REMARK: "",
+      NOTE: ""
+    }).map((header) => ({ header, key: header, width: Math.max(14, header.length + 4) }));
+    worksheet.addRows(exportRows);
+    worksheet.insertRow(1, [`${report.label} Attendance Report`]);
+    worksheet.insertRow(2, [`Range: ${formatDateLabel(report.start)} - ${formatDateLabel(addDays(report.end, -1))}`]);
+    worksheet.insertRow(3, [`Total Staff: ${report.summary.totalStaff} | Present: ${report.summary.present} | Absent: ${report.summary.absent} | Leave: ${report.summary.leave}`]);
+    worksheet.mergeCells("A1:D1");
+    worksheet.mergeCells("A2:D2");
+    worksheet.mergeCells("A3:F3");
+    worksheet.getRow(4).font = { bold: true };
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="attendance-${period}-report.xlsx"`);
+    await workbook.xlsx.write(res);
+    res.end();
+    } catch (err) {
+      console.error("attendance export xlsx error:", err);
+      res.status(500).json({ message: "Failed to generate Excel report" });
+    }
+  });
+  ownerRouter.get("/attendance/reports/export.pdf", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "view"), async (req, res) => {
+    try {
+    const period = ["daily", "weekly", "monthly"].includes(String(req.query.period || "").toLowerCase())
+      ? String(req.query.period).toLowerCase()
+      : "daily";
+    const branchId = req.query.branchId ? String(req.query.branchId) : null;
+    const report = await buildAttendanceReportDataset({
+      salonId: req.salonId,
+      branchId,
+      period,
+      referenceDate: req.query.date || new Date()
+    });
+    const doc = new PDFDocument({ margin: 36, size: "A4" });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="attendance-${period}-report.pdf"`);
+    doc.pipe(res);
+    doc.fontSize(16).text(`${report.label} Attendance Report`, { underline: true });
+    doc.moveDown(0.4);
+    doc.fontSize(10).text(`Range: ${formatDateLabel(report.start)} - ${formatDateLabel(addDays(report.end, -1))}`);
+    doc.text(`Total Staff: ${report.summary.totalStaff} | Present: ${report.summary.present} | Absent: ${report.summary.absent} | Leave: ${report.summary.leave}`);
+    doc.text(`Late: ${report.summary.late} | Half Day: ${report.summary.halfDay} | Working: ${report.summary.working} | Completed Shift: ${report.summary.completedShift}`);
+    doc.moveDown(0.8);
+    const exportRows = buildAttendanceExportRows(report.rows);
+    const colWidths = [25, 65, 85, 55, 50, 65, 40, 45, 40];
+    const headers = ["#", "DATE", "STAFF", "STATUS", "CHECK-IN", "CHECK-OUT", "HOURS", "BRANCH", "GEO"];
+    const tableTop = doc.y;
+    const rowHeight = 18;
+    const startX = 36;
+
+    const drawTableRow = (y, cells, isHeader = false) => {
+      let x = startX;
+      doc.fontSize(isHeader ? 8 : 7).fillColor(isHeader ? "#334155" : "#1e293b");
+      cells.forEach((cell, i) => {
+        if (isHeader) {
+          doc.rect(x, y, colWidths[i], rowHeight).fillAndStroke("#f1f5f9", "#cbd5e1");
+          doc.fillColor("#334155");
+        }
+        doc.text(String(cell || "-").substring(0, 20), x + 3, y + 4, { width: colWidths[i] - 6, height: rowHeight - 6, lineBreak: false });
+        x += colWidths[i];
+      });
+    };
+
+    drawTableRow(tableTop, headers, true);
+    let pageOffset = 0;
+    let isFirstOnPage = true;
+    exportRows.forEach((row) => {
+      const y = tableTop + (pageOffset + 1) * rowHeight;
+      if (y > 730) {
+        doc.addPage();
+        drawTableRow(36, headers, true);
+        pageOffset = 0;
+        isFirstOnPage = false;
+      }
+      const currentY = tableTop + (pageOffset + 1) * rowHeight;
+      const bgColor = pageOffset % 2 === 0 ? "#ffffff" : "#f8fafc";
+      let x = startX;
+      colWidths.forEach((w) => { doc.rect(x, currentY, w, rowHeight).fill(bgColor); x += w; });
+      drawTableRow(currentY, [row["SR. NO."], row.DATE, row.STAFF, row.STATUS, row["CHECK-IN"], row["CHECK-OUT"], row["WORKING HOURS"], row.BRANCH, row["GEO STATUS"]]);
+      pageOffset++;
+    });
+
+    doc.end();
+    } catch (err) {
+      console.error("attendance export pdf error:", err);
+      res.status(500).json({ message: "Failed to generate PDF report" });
+    }
+  });
+  ownerRouter.get("/attendance/records/:id", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "view"), async (req, res) => {
+    const row = await prisma.attendanceRecord.findFirst({
+      where: { id: req.params.id, salonId: req.salonId },
+      include: {
+        userSalon: { include: { user: true, branch: true } },
+        branch: true,
+        createdByMembership: { include: { user: true } },
+        manualEditedByMembership: { include: { user: true } }
+      }
+    });
+    if (!row) return res.status(404).json({ message: "Attendance record not found" });
+    const auditLogs = await prisma.auditLog.findMany({
+      where: { salonId: req.salonId, module: "ATTENDANCE", entityType: "AttendanceRecord", entityId: row.id },
+      include: { actorMembership: { include: { user: true } } },
+      orderBy: { createdAt: "desc" }
+    });
+    res.json({ ...row, auditLogs });
+  });
+  ownerRouter.post("/attendance", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "create"), validate(schemas.attendance), async (req, res) => {
+    try {
+    const settings = await getAttendanceSettings(req.salonId);
+    const attendanceDate = startOfAttendanceDay(req.body.attendanceDate || req.body.checkInAt || new Date());
+    const checkInAt = toDate(req.body.checkInAt) || new Date();
+    const checkOutAt = toDate(req.body.checkOutAt);
+    const workedMinutes = checkOutAt ? roundMinutesDiff(checkInAt, checkOutAt) : null;
+    const status = req.body.status || resolveAttendanceStatus({ attendanceDate, checkInAt, checkOutAt, workedMinutes, settings });
+    const existing = await prisma.attendanceRecord.findFirst({
+      where: {
+        salonId: req.salonId,
+        userSalonId: req.body.userSalonId,
+        attendanceDate
+      }
+    });
+
+    let created;
+    if (existing) {
+      created = await prisma.attendanceRecord.update({
+        where: { id: existing.id },
+        data: {
+          branchId: req.body.branchId || existing.branchId || null,
+          status,
+          verificationMethod: req.body.verificationMethod || existing.verificationMethod || "MANUAL",
+          checkInAt,
+          checkOutAt,
+          workedMinutes,
+          note: req.body.note !== undefined ? req.body.note : existing.note,
+          adminRemark: req.body.adminRemark !== undefined ? req.body.adminRemark : existing.adminRemark
+        }
+      });
+    } else {
+      created = await prisma.attendanceRecord.create({
+        data: {
+          salonId: req.salonId,
+          branchId: req.body.branchId || null,
+          userSalonId: req.body.userSalonId,
+          createdByMembershipId: req.user.membershipId || null,
+          attendanceDate,
+          status,
+          verificationMethod: req.body.verificationMethod || "MANUAL",
+          geoStatus: req.body.geoStatus || "NOT_CAPTURED",
+          checkInAt,
+          checkOutAt,
+          workedMinutes,
+          note: req.body.note || null,
+          adminRemark: req.body.adminRemark || null,
+          checkInLatitude: req.body.checkInLatitude,
+          checkInLongitude: req.body.checkInLongitude,
+          checkInAccuracyMeters: req.body.checkInAccuracyMeters,
+          checkInSelfieUrl: req.body.checkInSelfieUrl || null,
+          checkOutLatitude: req.body.checkOutLatitude,
+          checkOutLongitude: req.body.checkOutLongitude,
+          checkOutAccuracyMeters: req.body.checkOutAccuracyMeters,
+          checkOutSelfieUrl: req.body.checkOutSelfieUrl || null
+        }
+      });
+    }
+    await createAuditLog({
+      salonId: req.salonId,
+      actorUserId: req.user.userId,
+      actorMembershipId: req.user.membershipId,
+      module: "ATTENDANCE",
+      action: existing ? "MANUAL_UPDATE" : "MANUAL_CREATE",
+      entityType: "AttendanceRecord",
+      entityId: created.id,
+      summary: `Attendance manually ${existing ? 'updated' : 'created'} for ${created.userSalonId}`,
+      metadata: {
+        attendanceDate: created.attendanceDate,
+        status: created.status,
+        branchId: created.branchId,
+        verificationMethod: created.verificationMethod
+      }
+    });
+    res.status(existing ? 200 : 201).json(created);
+    } catch (err) {
+      if (err?.code === "P2002") return res.status(409).json({ message: "An attendance record already exists for this staff member on this date." });
+      console.error("manual attendance create error:", err);
+      res.status(500).json({ message: "Could not create attendance record" });
+    }
+  });
+  ownerRouter.post("/attendance/check-in", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "create"), validate(schemas.attendance), async (req, res) => {
+    try {
+      const membership = await prisma.userSalon.findFirst({
+        where: { id: req.body.userSalonId, salonId: req.salonId },
+        include: { branch: true }
+      });
+      const settings = await getAttendanceSettings(req.salonId);
+      const now = new Date();
+      const attendanceDate = startOfAttendanceDay(req.body.attendanceDate || now);
+      const branch = membership?.branch || null;
+      const status = req.body.status || resolveAttendanceStatus({
+        attendanceDate,
+        checkInAt: now,
+        checkOutAt: null,
+        workedMinutes: null,
+        settings,
+        branch
+      });
+      const existing = await prisma.attendanceRecord.findFirst({
+        where: {
+          salonId: req.salonId,
+          userSalonId: req.body.userSalonId,
+          attendanceDate
+        }
+      });
+
+      if (existing) {
+        const updated = await prisma.attendanceRecord.update({
+          where: { id: existing.id },
+          data: {
+            status,
+            checkInAt: existing.checkInAt || now,
+            branchId: req.body.branchId || existing.branchId || membership?.branchId || null,
+            note: req.body.note || existing.note || null
+          }
+        });
+        return res.status(200).json(updated);
+      }
+
+      res.status(201).json(await prisma.attendanceRecord.create({
+        data: {
+          salonId: req.salonId,
+          branchId: req.body.branchId || membership?.branchId || null,
+          userSalonId: req.body.userSalonId,
+          createdByMembershipId: req.user.membershipId || null,
+          attendanceDate,
+          status,
+          verificationMethod: req.body.verificationMethod || "MANUAL",
+          checkInAt: now,
+          note: req.body.note || null
+        }
+      }));
+    } catch (e) {
+      if (e.code === "P2002") return res.status(409).json({ message: "Attendance already marked for this staff member today." });
+      throw e;
+    }
+  });
+
+  ownerRouter.post("/attendance/biometric-event", requireSalonPermission("attendance", "create"), validate(schemas.attendanceBiometricEvent), async (req, res) => {
+    try {
+      const { staffCode, biometricUserId, userSalonId, eventType, timestamp, deviceId, deviceLocation } = req.body;
+      let membership = null;
+      if (userSalonId) {
+        membership = await prisma.userSalon.findFirst({ where: { id: userSalonId, salonId: req.salonId }, include: { branch: true, user: true } });
+      } else if (staffCode) {
+        membership = await prisma.userSalon.findFirst({
+          where: {
+            salonId: req.salonId,
+            OR: [
+              { id: staffCode },
+              { user: { is: { mobile: staffCode } } },
+              { user: { is: { email: staffCode } } }
+            ]
+          },
+          include: { branch: true, user: true }
+        });
+      } else if (biometricUserId) {
+        membership = await prisma.userSalon.findFirst({
+          where: {
+            salonId: req.salonId,
+            OR: [
+              { id: biometricUserId },
+              { uanNumber: biometricUserId },
+              { user: { is: { mobile: biometricUserId } } }
+            ]
+          },
+          include: { branch: true, user: true }
+        });
+      }
+      if (!membership) {
+        return res.status(404).json({ message: "Staff member not found for biometric identification." });
+      }
+
+      const eventTime = timestamp ? new Date(timestamp) : new Date();
+      const attendanceDate = startOfAttendanceDay(eventTime);
+      const settings = await getAttendanceSettings(req.salonId);
+
+      if (eventType === "CHECK_IN") {
+        const existing = await prisma.attendanceRecord.findFirst({
+          where: {
+            salonId: req.salonId,
+            userSalonId: membership.id,
+            attendanceDate: { gte: attendanceDate, lt: endOfAttendanceDay(attendanceDate) }
+          }
+        });
+        if (existing) {
+          return res.status(409).json({ message: "Attendance record already exists for today.", record: existing });
+        }
+        const status = resolveAttendanceStatus({
+          attendanceDate,
+          checkInAt: eventTime,
+          checkOutAt: null,
+          workedMinutes: null,
+          settings,
+          branch: membership.branch
+        });
+        const created = await prisma.attendanceRecord.create({
+          data: {
+            salonId: req.salonId,
+            branchId: membership.branchId,
+            userSalonId: membership.id,
+            attendanceDate,
+            checkInAt: eventTime,
+            status,
+            verificationMethod: "MANUAL",
+            geoStatus: "INSIDE",
+            adminRemark: `Biometric In [Device: ${deviceId || "N/A"}${deviceLocation ? ` @ ${deviceLocation}` : ""}]`,
+            note: "Biometric Check-In"
+          },
+          include: { branch: true, userSalon: { include: { user: true } } }
+        });
+        createAuditLog({
+          salonId: req.salonId,
+          actorUserId: req.user.userId,
+          actorMembershipId: req.user.membershipId,
+          module: "ATTENDANCE",
+          action: "BIOMETRIC_CHECK_IN",
+          entityType: "AttendanceRecord",
+          entityId: created.id,
+          summary: `Biometric check-in recorded for ${membership.user?.name || membership.id}`,
+          metadata: { deviceId, deviceLocation, status, timestamp: eventTime }
+        }).catch(() => {});
+        return res.status(201).json(created);
+      } else {
+        const existing = await prisma.attendanceRecord.findFirst({
+          where: {
+            salonId: req.salonId,
+            userSalonId: membership.id,
+            checkOutAt: null,
+            attendanceDate: { gte: attendanceDate, lt: endOfAttendanceDay(attendanceDate) }
+          },
+          orderBy: { checkInAt: "desc" }
+        });
+        if (!existing) {
+          return res.status(404).json({ message: "No open check-in record found to check out." });
+        }
+        const workedMinutes = roundMinutesDiff(existing.checkInAt, eventTime);
+        const status = resolveAttendanceStatus({
+          attendanceDate: existing.attendanceDate,
+          checkInAt: existing.checkInAt,
+          checkOutAt: eventTime,
+          workedMinutes,
+          settings,
+          branch: membership.branch
+        });
+        const updated = await prisma.attendanceRecord.update({
+          where: { id: existing.id },
+          data: {
+            checkOutAt: eventTime,
+            workedMinutes,
+            status,
+            adminRemark: existing.adminRemark
+              ? `${existing.adminRemark} | Biometric Out [Device: ${deviceId || "N/A"}]`
+              : `Biometric Out [Device: ${deviceId || "N/A"}]`,
+            note: existing.note ? `${existing.note} | Biometric Check-Out` : "Biometric Check-Out"
+          },
+          include: { branch: true, userSalon: { include: { user: true } } }
+        });
+        createAuditLog({
+          salonId: req.salonId,
+          actorUserId: req.user.userId,
+          actorMembershipId: req.user.membershipId,
+          module: "ATTENDANCE",
+          action: "BIOMETRIC_CHECK_OUT",
+          entityType: "AttendanceRecord",
+          entityId: updated.id,
+          summary: `Biometric check-out recorded for ${membership.user?.name || membership.id}`,
+          metadata: { deviceId, deviceLocation, workedMinutes, status, timestamp: eventTime }
+        }).catch(() => {});
+        return res.json(updated);
+      }
+    } catch (err) {
+      console.error("Biometric event error:", err);
+      res.status(500).json({ message: "Failed to process biometric attendance event" });
+    }
+  });
+
+  const requireSelfAttendancePermission = (action) => (req, res, next) => {
+    if (req.user.systemRole === "SUPER_ADMIN" || req.user.systemRole === "SALON_OWNER" || req.user.salonRole === "SALON_OWNER") return next();
+    const perms = req.user.permissions || {};
+    if (perms["attendance"]?.includes(action) || perms["myAttendance"]?.includes(action)) return next();
+    return res.status(403).json({ message: `No permission: attendance.${action}` });
+  };
+
+  ownerRouter.post("/attendance/check-in-self", requireFeatureEnabled("attendance"), requireSelfAttendancePermission("create"), validate(schemas.attendanceSelfAction), async (req, res) => {
+    try {
+      const membership = await prisma.userSalon.findFirst({
+        where: { id: req.user.membershipId, salonId: req.salonId, isArchived: false },
+        include: { branch: true }
+      });
+      if (!membership) return res.status(404).json({ message: "Staff profile not found" });
+      if (!membership.attendanceEnabled) {
+        return res.status(400).json({ message: "Attendance biometric is not configured by the salon owner yet." });
+      }
+      if (!req.body.selfieUrl) return res.status(400).json({ message: "Camera permission is required." });
+      if (!membership.branchId || !membership.branch) {
+        const fallbackBranch = await prisma.branch.findFirst({
+          where: { salonId: req.salonId, isActive: true },
+          orderBy: { createdAt: "asc" }
+        });
+        if (fallbackBranch) {
+          await prisma.userSalon.update({ where: { id: membership.id }, data: { branchId: fallbackBranch.id } });
+          membership.branchId = fallbackBranch.id;
+          membership.branch = fallbackBranch;
+        }
+      }
+      const existing = await prisma.attendanceRecord.findFirst({
+        where: {
+          salonId: req.salonId,
+          userSalonId: membership.id,
+          attendanceDate: { gte: startOfAttendanceDay(new Date()), lt: endOfAttendanceDay(new Date()) }
+        }
+      });
+      if (existing) return res.status(409).json({ message: "Attendance has already been marked today." });
+      const accuracyMeters = Number(req.body.accuracyMeters || 0);
+      const isAccurateGPS = accuracyMeters > 0 && accuracyMeters <= 1000;
+      let distance = 0;
+      let geoStatus = "NOT_CAPTURED";
+      if (membership.branch) {
+        const geoResult = validateGeofence({
+          branch: membership.branch,
+          latitude: req.body.latitude,
+          longitude: req.body.longitude
+        });
+        distance = geoResult.distance;
+        geoStatus = geoResult.geoStatus;
+        if (isAccurateGPS && geoStatus === "OUTSIDE") return res.status(400).json({ message: `You are ${Math.round(distance)}m from the salon. Allowed radius: ${Math.round(Number(membership.branch?.geofenceRadiusMeters || 200))}m. Please move closer.` });
+      }
+      const settings = await getAttendanceSettings(req.salonId);
+      const now = new Date();
+      const status = resolveAttendanceStatus({
+        attendanceDate: startOfAttendanceDay(now),
+        checkInAt: now,
+        checkOutAt: null,
+        workedMinutes: null,
+        settings,
+        branch: membership.branch
+      });
+      const created = await prisma.attendanceRecord.create({
+        data: {
+          salonId: req.salonId,
+          branchId: membership.branchId,
+          userSalonId: membership.id,
+          createdByMembershipId: membership.id,
+          attendanceDate: startOfAttendanceDay(now),
+          status,
+          verificationMethod: req.body.selfieUrl ? "SELFIE_GPS" : "GPS_ONLY",
+          geoStatus,
+          checkInAt: now,
+          checkInLatitude: req.body.latitude,
+          checkInLongitude: req.body.longitude,
+          checkInAccuracyMeters: req.body.accuracyMeters,
+          checkInSelfieUrl: req.body.selfieUrl || null,
+          note: req.body.note || null,
+          adminRemark: `Check-in distance ${Math.round(distance)}m`
+        },
+        include: { branch: true, userSalon: { include: { user: true } } }
+      });
+      createAuditLog({
+        salonId: req.salonId,
+        actorUserId: req.user.userId,
+        actorMembershipId: membership.id,
+        module: "ATTENDANCE",
+        action: "CHECK_IN",
+        entityType: "AttendanceRecord",
+        entityId: created.id,
+        summary: `Self check-in by ${membership.user?.name || "staff"}`,
+        metadata: { verificationMethod: created.verificationMethod, geoStatus, distance: Math.round(distance) }
+      }).catch(() => {});
+      res.status(201).json(created);
+    } catch (e) {
+      if (e.code === "P2002") return res.status(409).json({ message: "Attendance already marked for today." });
+      if (e.status && e.message) return res.status(e.status).json({ message: e.message });
+      console.error("self check-in error:", e);
+      res.status(500).json({ message: "Failed to record attendance" });
+    }
+  });
+
+  ownerRouter.post("/attendance/check-out", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "edit"), validate(schemas.attendance), async (req, res) => {
+    try {
+      const today = startOfAttendanceDay(new Date());
+      const tomorrow = endOfAttendanceDay(new Date());
+      const row = await prisma.attendanceRecord.findFirst({
+        where: { salonId: req.salonId, userSalonId: req.body.userSalonId, checkOutAt: null, attendanceDate: { gte: today, lt: tomorrow } },
+        orderBy: { checkInAt: "desc" }
+      });
+      if (!row || row.checkOutAt) return res.status(404).json({ message: "Open attendance record not found" });
+      const checkOutAt = new Date();
+      if (new Date(checkOutAt) <= new Date(row.checkInAt)) return res.status(400).json({ message: "Check-out time cannot be before check-in time." });
+      const workedMinutes = roundMinutesDiff(row.checkInAt, checkOutAt);
+      const settings = await getAttendanceSettings(req.salonId);
+      const membership = await prisma.userSalon.findFirst({ where: { id: row.userSalonId }, include: { branch: true } });
+      const status = resolveAttendanceStatus({ attendanceDate: row.attendanceDate, checkInAt: row.checkInAt, checkOutAt, workedMinutes, settings, branch: membership?.branch });
+      res.json(await prisma.attendanceRecord.update({ where: { id: row.id }, data: { checkOutAt, workedMinutes, status, note: req.body.note || row.note } }));
+    } catch (err) {
+      console.error("admin check-out error:", err);
+      res.status(500).json({ message: "Failed to complete check-out" });
+    }
+  });
+
+  ownerRouter.post("/attendance/check-out-self", requireFeatureEnabled("attendance"), requireSelfAttendancePermission("edit"), validate(schemas.attendanceSelfAction), async (req, res) => {
+    try {
+      const [membership, settings] = await Promise.all([
+        prisma.userSalon.findFirst({
+          where: { id: req.user.membershipId, salonId: req.salonId, isArchived: false },
+          include: { branch: true }
+        }),
+        getAttendanceSettings(req.salonId)
+      ]);
+      if (!membership) return res.status(404).json({ message: "Staff profile not found" });
+      if (!membership.attendanceEnabled) {
+        return res.status(400).json({ message: "Attendance biometric is not configured by the salon owner yet." });
+      }
+      if (!membership.branchId || !membership.branch) {
+        const fallbackBranch = await prisma.branch.findFirst({
+          where: { salonId: req.salonId, isActive: true },
+          orderBy: { createdAt: "asc" }
+        });
+        if (fallbackBranch) {
+          await prisma.userSalon.update({ where: { id: membership.id }, data: { branchId: fallbackBranch.id } });
+          membership.branchId = fallbackBranch.id;
+          membership.branch = fallbackBranch;
+        }
+      }
+      if (settings.checkoutSelfieRequired && !req.body.selfieUrl) return res.status(400).json({ message: "Camera selfie is required." });
+      const today = startOfAttendanceDay(new Date());
+      const tomorrow = endOfAttendanceDay(new Date());
+      const row = await prisma.attendanceRecord.findFirst({
+        where: { salonId: req.salonId, userSalonId: membership.id, checkOutAt: null, attendanceDate: { gte: today, lt: tomorrow } },
+        orderBy: { checkInAt: "desc" }
+      });
+      if (!row) return res.status(404).json({ message: "Open attendance record not found" });
+      const accuracyMeters = Number(req.body.accuracyMeters || 0);
+      const isAccurateGPS = accuracyMeters > 0 && accuracyMeters <= 1000;
+      let distance = 0;
+      let geoStatus = "NOT_CAPTURED";
+      if (membership.branch) {
+        const geoResult = validateGeofence({
+          branch: membership.branch,
+          latitude: req.body.latitude,
+          longitude: req.body.longitude
+        });
+        distance = geoResult.distance;
+        geoStatus = geoResult.geoStatus;
+        if (isAccurateGPS && geoStatus === "OUTSIDE") return res.status(400).json({ message: `You are ${Math.round(distance)}m from the salon. Allowed radius: ${Math.round(Number(membership.branch?.geofenceRadiusMeters || 200))}m. Please move closer.` });
+      }
+      const checkOutAt = new Date();
+      if (new Date(checkOutAt) <= new Date(row.checkInAt)) return res.status(400).json({ message: "Check-out time cannot be before check-in time." });
+      const workedMinutes = roundMinutesDiff(row.checkInAt, checkOutAt);
+      const status = resolveAttendanceStatus({ attendanceDate: row.attendanceDate, checkInAt: row.checkInAt, checkOutAt, workedMinutes, settings, branch: membership.branch });
+      const updated = await prisma.attendanceRecord.update({
+        where: { id: row.id },
+        data: {
+          checkOutAt,
+          workedMinutes,
+          status,
+          geoStatus,
+          checkOutLatitude: req.body.latitude,
+          checkOutLongitude: req.body.longitude,
+          checkOutAccuracyMeters: req.body.accuracyMeters,
+          checkOutSelfieUrl: req.body.selfieUrl || null,
+          note: req.body.note || row.note,
+          adminRemark: row.adminRemark ? `${row.adminRemark} | Check-out distance ${Math.round(distance)}m` : `Check-out distance ${Math.round(distance)}m`
+        }
+      });
+      createAuditLog({
+        salonId: req.salonId,
+        actorUserId: req.user.userId,
+        actorMembershipId: membership.id,
+        module: "ATTENDANCE",
+        action: "CHECK_OUT",
+        entityType: "AttendanceRecord",
+        entityId: updated.id,
+        summary: `Self check-out by ${membership.user?.name || "staff"}`,
+        metadata: { status, workedMinutes, distance: Math.round(distance) }
+      }).catch(() => {});
+      res.json(updated);
+    } catch (err) {
+      if (err.status && err.message) return res.status(err.status).json({ message: err.message });
+      console.error("self check-out error:", err);
+      res.status(500).json({ message: "Failed to complete check-out" });
+    }
+  });
+
+  ownerRouter.get("/my-attendance", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "view"), async (req, res) => {
+    res.json(await prisma.attendanceRecord.findMany({
+      where: { salonId: req.salonId, userSalonId: req.user.membershipId },
+      include: { branch: true },
+      orderBy: [{ attendanceDate: "desc" }, { checkInAt: "desc" }]
+    }));
+  });
+
+  ownerRouter.patch("/attendance/:id/manual-update", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "edit"), validate(schemas.attendanceManualUpdate), async (req, res) => {
+    const settings = await getAttendanceSettings(req.salonId);
+    if (!settings.allowManualAttendanceEdits) return res.status(403).json({ message: "Manual attendance edits are disabled." });
+    const row = await prisma.attendanceRecord.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+    if (!row) return res.status(404).json({ message: "Attendance record not found" });
+    const nextCheckInAt = req.body.checkInAt !== undefined ? toDate(req.body.checkInAt) : row.checkInAt;
+    const nextCheckOutAt = req.body.checkOutAt !== undefined ? toDate(req.body.checkOutAt) : row.checkOutAt;
+    const nextAttendanceDate = req.body.attendanceDate ? startOfAttendanceDay(req.body.attendanceDate) : row.attendanceDate;
+    const workedMinutes = nextCheckOutAt ? roundMinutesDiff(nextCheckInAt, nextCheckOutAt) : null;
+    const status = req.body.status || resolveAttendanceStatus({
+      attendanceDate: nextAttendanceDate,
+      checkInAt: nextCheckInAt,
+      checkOutAt: nextCheckOutAt,
+      workedMinutes,
+      settings
+    });
+    const updated = await prisma.attendanceRecord.update({
+      where: { id: row.id },
+      data: {
+        attendanceDate: nextAttendanceDate,
+        checkInAt: nextCheckInAt,
+        checkOutAt: nextCheckOutAt,
+        workedMinutes,
+        status,
+        note: req.body.note ?? row.note,
+        adminRemark: req.body.adminRemark ?? row.adminRemark,
+        manualEdited: true,
+        manualEditedAt: new Date(),
+        manualEditedByMembershipId: req.user.membershipId || null,
+        verificationMethod: "MANUAL"
+      }
+    });
+    const staffProfile = await prisma.userSalon.findFirst({
+      where: { id: updated.userSalonId },
+      include: { user: true }
+    });
+    const staffName = staffProfile?.user?.name || "Unknown";
+    await createAuditLog({
+      salonId: req.salonId,
+      actorUserId: req.user.userId,
+      actorMembershipId: req.user.membershipId,
+      module: "ATTENDANCE",
+      action: "MANUAL_UPDATE",
+      entityType: "AttendanceRecord",
+      entityId: updated.id,
+      summary: `Attendance manually updated for ${staffName}`,
+      metadata: {
+        reason: req.body.reason,
+        previousValue: {
+          attendanceDate: row.attendanceDate,
+          checkInAt: row.checkInAt,
+          checkOutAt: row.checkOutAt,
+          workedMinutes: row.workedMinutes,
+          status: row.status,
+          note: row.note,
+          adminRemark: row.adminRemark
+        },
+        updatedValue: {
+          attendanceDate: updated.attendanceDate,
+          checkInAt: updated.checkInAt,
+          checkOutAt: updated.checkOutAt,
+          workedMinutes: updated.workedMinutes,
+          status: updated.status,
+          note: updated.note,
+          adminRemark: updated.adminRemark
+        }
+      }
+    });
+    res.json(updated);
+  });
+  ownerRouter.get("/attendance/:staffId", requireFeatureEnabled("attendance"), requireSalonPermission("attendance", "view"), async (req, res) => {
+    res.json(await prisma.attendanceRecord.findMany({
+      where: { salonId: req.salonId, userSalonId: req.params.staffId },
+      include: { branch: true },
+      orderBy: [{ attendanceDate: "desc" }, { checkInAt: "desc" }]
+    }));
+  });
+
+  ownerRouter.get("/leaves", requireFeatureEnabled("leaves"), requireSalonPermission("leaves", "view"), async (req, res) => {
+    const q = String(req.query.q || "").trim();
+    const status = String(req.query.status || "").trim();
+    const branchId = req.query.branchId ? String(req.query.branchId) : null;
+    const userSalonFilter = branchId && q
+      ? { userSalon: { is: { OR: [{ branchId }, { branchId: null }], user: { is: { name: { contains: q, mode: "insensitive" } } } } } }
+      : branchId
+        ? { userSalon: { is: { OR: [{ branchId }, { branchId: null }] } } }
+        : q
+          ? { userSalon: { is: { user: { is: { name: { contains: q, mode: "insensitive" } } } } } }
+          : {};
+    res.json(await prisma.leaveRequest.findMany({
+      where: {
+        salonId: req.salonId,
+        ...(status ? { status } : {}),
+        ...userSalonFilter
+      },
+      include: { userSalon: { include: { user: true } }, approvedByMembership: { include: { user: true } } },
+      orderBy: { createdAt: "desc" }
+    }));
+  });
+  ownerRouter.post("/leaves", requireFeatureEnabled("leaves"), requireSalonPermission("leaves", "create"), validate(schemas.leaveRequest), async (req, res) => {
+    const userSalonId = req.body.userSalonId || req.user.membershipId;
+    res.status(201).json(await prisma.leaveRequest.create({
+      data: {
+        salonId: req.salonId,
+        userSalonId,
+        startDate: new Date(req.body.startDate),
+        endDate: new Date(req.body.endDate),
+        reason: req.body.reason || null,
+        note: req.body.note || null
+      }
+    }));
+  });
+  ownerRouter.get("/leaves/:id", requireFeatureEnabled("leaves"), requireSalonPermission("leaves", "view"), async (req, res) => {
+    const row = await prisma.leaveRequest.findFirst({ where: { id: req.params.id, salonId: req.salonId }, include: { userSalon: { include: { user: true } } } });
+    if (!row) return res.status(404).json({ message: "Leave request not found" });
+    res.json(row);
+  });
+  ownerRouter.patch("/leaves/:id/approve", requireFeatureEnabled("leaves"), requireSalonPermission("leaves", "approve"), validate(schemas.leaveStatus), async (req, res) => {
+    const row = await prisma.leaveRequest.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+    if (!row) return res.status(404).json({ message: "Leave request not found" });
+    const updated = await prisma.leaveRequest.update({ where: { id: row.id }, data: { status: "APPROVED", note: req.body.note || row.note, approvedByMembershipId: req.user.membershipId || null } });
+    try {
+      const startDate = new Date(row.startDate);
+      const endDate = new Date(row.endDate);
+      const days = [];
+      const cursor = new Date(startDate);
+      while (cursor <= endDate) {
+        days.push(startOfAttendanceDay(cursor));
+        cursor.setDate(cursor.getDate() + 1);
+      }
+      const userSalon = await prisma.userSalon.findFirst({ where: { id: row.userSalonId }, select: { branchId: true } });
+    for (const day of days) {
+        const existing = await prisma.attendanceRecord.findFirst({
+          where: { salonId: row.salonId, userSalonId: row.userSalonId, attendanceDate: day }
+        });
+        if (existing) {
+          if (existing.status !== "LEAVE") {
+            await prisma.attendanceRecord.update({ where: { id: existing.id }, data: { status: "LEAVE", note: `Leave approved: ${row.reason || "N/A"}` } });
+          }
+        } else {
+          await prisma.attendanceRecord.create({
+            data: {
+              salonId: row.salonId,
+              userSalonId: row.userSalonId,
+              branchId: userSalon?.branchId || null,
+              createdByMembershipId: req.user.membershipId || null,
+              attendanceDate: day,
+              status: "LEAVE",
+              verificationMethod: "MANUAL",
+              checkInAt: day,
+              note: `Auto-created: Leave approved (${row.reason || "N/A"})`
+            }
+          });
+        }
+      }
+    } catch (err) {
+      console.error("leave approval attendance error:", err);
+    }
+    res.json(updated);
+  });
+  ownerRouter.patch("/leaves/:id/reject", requireFeatureEnabled("leaves"), requireSalonPermission("leaves", "approve"), validate(schemas.leaveStatus), async (req, res) => {
+    const row = await prisma.leaveRequest.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+    if (!row) return res.status(404).json({ message: "Leave request not found" });
+    res.json(await prisma.leaveRequest.update({ where: { id: row.id }, data: { status: "REJECTED", note: req.body.note || row.note, approvedByMembershipId: req.user.membershipId || null } }));
+  });
+
+  ownerRouter.get("/notifications", requireFeatureEnabled("notifications"), requireSalonPermission("notifications", "view"), async (req, res) => {
+    const q = String(req.query.q || "").trim();
+    const type = String(req.query.type || "").trim();
+    const isRead = req.query.isRead === "true" ? true : req.query.isRead === "false" ? false : undefined;
+    res.json(await prisma.notification.findMany({
+      where: {
+        salonId: req.salonId,
+        AND: [
+          { OR: [{ userSalonId: null }, { userSalonId: req.user.membershipId || "" }] },
+          ...(q ? [{
+            OR: [
+              { title: { contains: q, mode: "insensitive" } },
+              { message: { contains: q, mode: "insensitive" } },
+              { type: { contains: q, mode: "insensitive" } },
+              { linkUrl: { contains: q, mode: "insensitive" } }
+            ]
+          }] : [])
+        ],
+        ...(type ? { type } : {}),
+        ...(isRead !== undefined ? { isRead } : {})
+      },
+      orderBy: { createdAt: "desc" }
+    }));
+  });
+  ownerRouter.get("/notifications/export.csv", requireFeatureEnabled("notifications"), requireSalonPermission("notifications", "view"), async (req, res) => {
+    const q = String(req.query.q || "").trim();
+    const type = String(req.query.type || "").trim();
+    const isRead = req.query.isRead === "true" ? true : req.query.isRead === "false" ? false : undefined;
+    const rows = await prisma.notification.findMany({
+      where: {
+        salonId: req.salonId,
+        AND: [
+          { OR: [{ userSalonId: null }, { userSalonId: req.user.membershipId || "" }] },
+          ...(q ? [{
+            OR: [
+              { title: { contains: q, mode: "insensitive" } },
+              { message: { contains: q, mode: "insensitive" } },
+              { type: { contains: q, mode: "insensitive" } },
+              { linkUrl: { contains: q, mode: "insensitive" } }
+            ]
+          }] : [])
+        ],
+        ...(type ? { type } : {}),
+        ...(isRead !== undefined ? { isRead } : {})
+      },
+      orderBy: { createdAt: "desc" }
+    });
+    const csv = buildCsv(
+      ["Title", "Message", "Type", "Read", "Link", "Created At"],
+      rows.map((row) => [row.title, row.message, row.type, row.isRead ? "Yes" : "No", row.linkUrl || "", row.createdAt ? new Date(row.createdAt).toISOString() : ""])
+    );
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", "attachment; filename=\"notifications-export.csv\"");
+    res.send(csv);
+  });
+  ownerRouter.patch("/notifications/:id/read", requireFeatureEnabled("notifications"), requireSalonPermission("notifications", "edit"), async (req, res) => {
+    const row = await prisma.notification.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+    if (!row) return res.status(404).json({ message: "Notification not found" });
+    res.json(await prisma.notification.update({ where: { id: row.id }, data: { isRead: true } }));
+  });
+  ownerRouter.patch("/notifications/read-all", requireFeatureEnabled("notifications"), requireSalonPermission("notifications", "edit"), async (req, res) => {
+    await prisma.notification.updateMany({ where: { salonId: req.salonId, OR: [{ userSalonId: null }, { userSalonId: req.user.membershipId || "" }] }, data: { isRead: true } });
+    res.json({ ok: true });
+  });
+  ownerRouter.post("/notifications/test-placeholder", requireFeatureEnabled("notifications"), requireSalonPermission("notifications", "create"), validate(schemas.notificationTest), async (req, res) => {
+    res.status(201).json(await createStaffNotification({
+      salonId: req.salonId,
+      userSalonId: req.body.userSalonId || null,
+      title: req.body.title,
+      message: req.body.message,
+      linkUrl: req.body.linkUrl || null,
+      type: "TEST"
+    }));
+  });
+
+  ownerRouter.get("/audit-logs", requireFeatureEnabled("auditLogs"), requireSalonPermission("auditLogs", "view"), async (req, res) => {
+    const q = String(req.query.q || "").trim();
+    res.json(await prisma.auditLog.findMany({
+      where: {
+        salonId: req.salonId,
+        ...(req.query.module ? { module: String(req.query.module) } : {}),
+        ...(req.query.action ? { action: String(req.query.action) } : {}),
+        ...(q ? {
+          OR: [
+            { module: { contains: q, mode: "insensitive" } },
+            { action: { contains: q, mode: "insensitive" } },
+            { entityType: { contains: q, mode: "insensitive" } },
+            { entityId: { contains: q, mode: "insensitive" } },
+            { summary: { contains: q, mode: "insensitive" } },
+            { reference: { contains: q, mode: "insensitive" } }
+          ]
+        } : {})
+      },
+      orderBy: { createdAt: "desc" }
+    }));
+  });
+  ownerRouter.get("/audit-logs/export.csv", requireFeatureEnabled("auditLogs"), requireSalonPermission("auditLogs", "view"), async (req, res) => {
+    const q = String(req.query.q || "").trim();
+    const rows = await prisma.auditLog.findMany({
+      where: {
+        salonId: req.salonId,
+        ...(req.query.module ? { module: String(req.query.module) } : {}),
+        ...(req.query.action ? { action: String(req.query.action) } : {}),
+        ...(q ? {
+          OR: [
+            { module: { contains: q, mode: "insensitive" } },
+            { action: { contains: q, mode: "insensitive" } },
+            { entityType: { contains: q, mode: "insensitive" } },
+            { entityId: { contains: q, mode: "insensitive" } },
+            { summary: { contains: q, mode: "insensitive" } },
+            { reference: { contains: q, mode: "insensitive" } }
+          ]
+        } : {})
+      },
+      orderBy: { createdAt: "desc" }
+    });
+    const csv = buildCsv(
+      ["Module", "Action", "Entity Type", "Entity Id", "Summary", "Reference", "Created At"],
+      rows.map((row) => [row.module, row.action, row.entityType || "", row.entityId || "", row.summary || "", row.reference || "", row.createdAt ? new Date(row.createdAt).toISOString() : ""])
+    );
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", "attachment; filename=\"audit-logs-export.csv\"");
+    res.send(csv);
+  });
+};

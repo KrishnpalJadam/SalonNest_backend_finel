@@ -1,0 +1,1570 @@
+import crypto from "crypto";
+import { prisma } from "./prisma.js";
+import { createStockMovement, convertConsumableQty, ensureScopedBranch, ensureScopedCustomer, ensureScopedService, ensureScopedStaffMembership, getSalonSetting, logCustomerTimeline, refreshCustomerInsights, toAmount } from "./phase2.js";
+import { calculateLoyaltyEarnPoints, getCustomerValidLoyaltyBalance, reverseInvoiceLoyalty } from "./phase4.js";
+
+const normalizeStatus = (paidAmount, total, refundAmount = 0, cancelled = false) => {
+  if (cancelled) return "CANCELLED";
+  if (total <= 0) return "PAID";
+  if (refundAmount >= total && total > 0) return "REFUNDED";
+  if (paidAmount >= total) return "PAID";
+  if (paidAmount > 0) return "PARTIAL";
+  return "UNPAID";
+};
+
+const toNumber = (value) => Number(value || 0);
+const getAffiliateServiceCreditValue = (advancedSettings = {}) => {
+  const value = toAmount(advancedSettings?.referralSettings?.affiliateServiceCreditValue);
+  return value > 0 ? value : 1;
+};
+
+export const createInvoiceNumber = async (tx, salonId, branchId) => {
+  // Concurrency-safe invoice number generation: append a short random suffix to
+  // avoid the read-then-write race that used to produce duplicate `invoiceNumber`
+  // errors under concurrent invoice creation. The `@unique` constraint on
+  // `invoiceNumber` would otherwise cause one of the two concurrent inserts
+  // to fail with a 500. Prefix is preserved for human-readable invoices.
+  const settings = await getSalonSetting(tx, salonId, branchId);
+  const prefix = settings?.invoicePrefix || "INV";
+  const dateKey = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const random = crypto.randomBytes(2).toString("hex").toUpperCase();
+  return `${prefix}-${dateKey}-${random}`;
+};
+
+const ensureProduct = async (salonId, branchId, productId) => {
+  const product = await prisma.product.findFirst({
+    where: { id: productId, salonId, isActive: true }
+  });
+  if (!product) {
+    const error = new Error("Product not found");
+    error.status = 404;
+    throw error;
+  }
+  if (branchId && product.branchId && product.branchId !== branchId) {
+    const error = new Error("Product belongs to a different branch");
+    error.status = 400;
+    throw error;
+  }
+  return product;
+};
+
+const ensureActiveCustomerMembership = async (salonId, customerId, membershipId) => {
+  if (!membershipId) return null;
+  const membership = await prisma.customerMembership.findFirst({
+    where: { id: membershipId, salonId, customerId },
+    include: { membershipPlan: { include: { services: true } } }
+  });
+  if (!membership || membership.status !== "ACTIVE" || new Date(membership.endsAt) < new Date()) {
+    const error = new Error("Active membership not found");
+    error.status = 400;
+    throw error;
+  }
+  return membership;
+};
+
+const ensureActiveCustomerPackage = async (salonId, customerPackageId) => {
+  const customerPackage = await prisma.customerPackage.findFirst({
+    where: { id: customerPackageId, salonId },
+    include: { package: true }
+  });
+  if (!customerPackage || customerPackage.status !== "ACTIVE" || new Date(customerPackage.endsAt) < new Date()) {
+    const error = new Error("Active package not found");
+    error.status = 400;
+    throw error;
+  }
+  return customerPackage;
+};
+
+const ensureMembershipPlan = async (salonId, planId) => {
+  const plan = await prisma.membershipPlan.findFirst({ where: { id: planId, salonId, isActive: true } });
+  if (!plan) {
+    const error = new Error("Membership plan not found");
+    error.status = 404;
+    throw error;
+  }
+  return plan;
+};
+
+const ensurePackagePlan = async (salonId, packageId) => {
+  const pack = await prisma.package.findFirst({ where: { id: packageId, salonId, isActive: true } });
+  if (!pack) {
+    const error = new Error("Package not found");
+    error.status = 404;
+    throw error;
+  }
+  return pack;
+};
+
+const createPaymentRows = async (tx, salonId, invoiceId, payments, customerId) => {
+  if (!payments.length) return [];
+  await tx.payment.createMany({
+    data: payments.map((payment) => ({
+      salonId,
+      invoiceId,
+      amount: toAmount(payment.amount),
+      mode: payment.mode,
+      note: payment.note || null,
+      type: payment.type || "PAYMENT",
+      onlineStatus: payment.onlineStatus || null,
+      gatewayName: payment.gatewayName || null,
+      gatewayRef: payment.gatewayRef || null
+    }))
+  });
+
+  const walletPayments = payments.filter((p) => p.mode === "WALLET" && toAmount(p.amount) > 0);
+  if (walletPayments.length > 0 && customerId) {
+    const totalWalletAmount = walletPayments.reduce((sum, p) => sum + toAmount(p.amount), 0);
+    const wallet = await tx.wallet.findUnique({
+      where: { salonId_customerId: { salonId, customerId } }
+    });
+    if (!wallet || Number(wallet.balance) < totalWalletAmount) {
+      const err = new Error(`Insufficient wallet balance. Available: ₹${Number(wallet?.balance || 0).toFixed(2)}, Required: ₹${totalWalletAmount.toFixed(2)}`);
+      err.status = 400;
+      throw err;
+    }
+    const updatedWallet = await tx.wallet.update({
+      where: { id: wallet.id },
+      data: {
+        balance: { decrement: totalWalletAmount },
+        totalUsed: { increment: totalWalletAmount }
+      }
+    });
+    await tx.walletTransaction.create({
+      data: {
+        salonId,
+        walletId: wallet.id,
+        customerId,
+        type: "POS_PAYMENT",
+        amount: totalWalletAmount,
+        balanceAfter: updatedWallet.balance,
+        referenceId: invoiceId,
+        note: `POS invoice payment (${invoiceId})`
+      }
+    });
+  }
+
+  return tx.payment.findMany({ where: { invoiceId } });
+};
+
+const buildInvoiceNotes = ({ notes, couponCode, giftVoucherCode, loyaltyPointsUsed, affiliateCreditRedemptions }) => {
+  const lines = [];
+  if (notes) lines.push(notes);
+  if (couponCode) lines.push(`Coupon applied: ${couponCode}`);
+  if (giftVoucherCode) lines.push(`Gift card applied: ${giftVoucherCode}`);
+  if (Number(loyaltyPointsUsed || 0) > 0) lines.push(`Loyalty points redeemed: ${Number(loyaltyPointsUsed)}`);
+  const affiliateCredits = (affiliateCreditRedemptions || []).reduce((sum, row) => sum + toAmount(row.amount), 0);
+  if (affiliateCredits > 0) lines.push(`Affiliate credits redeemed: ${affiliateCredits}`);
+  return lines.join("\n").trim() || null;
+};
+
+export const createPosInvoice = async ({ salonId, actorUser, body }) => {
+  await ensureScopedCustomer(salonId, body.customerId);
+  await ensureScopedBranch(salonId, body.branchId);
+  const membership = await ensureActiveCustomerMembership(salonId, body.customerId, body.appliedMembershipId);
+
+  const salonSettings = await prisma.salonSetting.findFirst({ where: { salonId, branchId: null } });
+  const advancedSettings = salonSettings?.advancedSettings && typeof salonSettings.advancedSettings === "object"
+    ? salonSettings.advancedSettings
+    : {};
+  const allowPriceEdit = advancedSettings.allowPriceEditOnBill !== false;
+  const allowFutureBackdatedBills = advancedSettings.allowFutureBackdatedBills !== false;
+  const allowEditConsumable = advancedSettings.allowEditConsumable !== false;
+  const membershipSettings = {};
+  const inclusiveTax = advancedSettings?.taxMapping?.inclusiveTax === true;
+  const affiliateServiceCreditValue = getAffiliateServiceCreditValue(advancedSettings);
+
+  if (!allowFutureBackdatedBills && body.invoiceDate) {
+    const invoiceDate = new Date(body.invoiceDate);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (invoiceDate >= tomorrow || invoiceDate < yesterday) {
+      const error = new Error("Future or backdated bills are restricted by salon settings");
+      error.status = 400;
+      throw error;
+    }
+  }
+
+  const itemDrafts = [];
+  for (const item of body.items) {
+    const itemType = item.itemType || (item.productId ? "PRODUCT" : item.membershipPlanId ? "MEMBERSHIP" : item.packageId ? "PACKAGE" : "SERVICE");
+    if (itemType === "SERVICE") {
+      const service = await ensureScopedService(salonId, item.serviceId);
+      const staffMembership = item.staffUserId ? await ensureScopedStaffMembership(salonId, item.staffUserId) : null;
+      if (staffMembership?.serviceAssignments?.length) {
+        const hasAssignment = staffMembership.serviceAssignments.some((assignment) => assignment.serviceId === service.id);
+        if (!hasAssignment) {
+          const error = new Error("Selected staff member is not assigned to this service");
+          error.status = 400;
+          throw error;
+        }
+      }
+
+      let unitPrice = item.unitPrice != null ? toAmount(item.unitPrice) : toAmount(service.price);
+      const isPackageRedemption = (body.packageRedemptions || []).some((pr) => pr.serviceId === item.serviceId);
+      const isDiscounted = toAmount(item.discountAmt) > 0 || toAmount(item.discountPct) > 0;
+      if (!allowPriceEdit && unitPrice !== toAmount(service.price) && !isPackageRedemption && !isDiscounted) {
+        const error = new Error("Price edits on the bill are restricted by salon settings");
+        error.status = 400;
+        throw error;
+      }
+      let appliedBenefitType = null;
+      let appliedBenefitValue = 0;
+      let membershipWalletUsed = 0;
+
+      if (membership) {
+        const serviceAllowed = !membership.membershipPlan.serviceSpecificOnly
+          || membership.membershipPlan.services.some((entry) => entry.serviceId === service.id);
+        if (serviceAllowed) {
+          if (membership.membershipPlan.benefitType === "DISCOUNT_PERCENT") {
+            appliedBenefitType = "MEMBERSHIP_PERCENT";
+            appliedBenefitValue = (unitPrice * toAmount(membership.membershipPlan.discountValue)) / 100;
+            unitPrice = Math.max(0, unitPrice - appliedBenefitValue);
+          } else if (membership.membershipPlan.benefitType === "DISCOUNT_AMOUNT") {
+            appliedBenefitType = "MEMBERSHIP_FIXED";
+            appliedBenefitValue = Math.min(unitPrice, toAmount(membership.membershipPlan.discountValue));
+            unitPrice = Math.max(0, unitPrice - appliedBenefitValue);
+          } else if (membership.membershipPlan.benefitType === "WALLET_VALUE") {
+            if (item.membershipWalletUsed !== undefined) {
+              membershipWalletUsed = Math.min(toAmount(item.membershipWalletUsed), toAmount(membership.remainingWalletValue));
+            } else {
+              membershipWalletUsed = Math.min(unitPrice, toAmount(membership.remainingWalletValue));
+              unitPrice = Math.max(0, unitPrice - membershipWalletUsed);
+            }
+            appliedBenefitType = membershipWalletUsed ? "MEMBERSHIP_WALLET" : null;
+            appliedBenefitValue = membershipWalletUsed;
+          }
+        }
+      }
+
+      const qty = Number(item.qty || 1);
+      const taxPct = toAmount(item.taxPct != null ? item.taxPct : service.taxRate || 0);
+      const preTax = unitPrice * qty;
+      const lineTotal = inclusiveTax && taxPct > 0
+        ? preTax
+        : preTax + (preTax * taxPct) / 100;
+      const commissionAmount = service.commissionPct ? (preTax * toAmount(service.commissionPct)) / 100 : 0;
+
+      itemDrafts.push({
+        itemType,
+        serviceId: service.id,
+        categoryId: service.categoryId || null,
+        staffUserSalonId: staffMembership?.id || null,
+        serviceName: service.name,
+        staffName: staffMembership?.user.name || item.staffName || null,
+        qty,
+        unitPrice,
+        taxPct,
+        lineTotal,
+        appliedBenefitType,
+        appliedBenefitValue,
+        membershipWalletUsed,
+        commissionAmount,
+        complimentaryRemark: item.complimentaryRemark || null
+      });
+      continue;
+    }
+
+    if (itemType === "PRODUCT") {
+      const product = await ensureProduct(salonId, body.branchId, item.productId);
+      const qty = Number(item.qty || 1);
+      const unitPrice = item.unitPrice != null ? toAmount(item.unitPrice) : toAmount(product.sellingPrice);
+      if (!allowPriceEdit && unitPrice !== toAmount(product.sellingPrice)) {
+        const error = new Error("Price edits on the bill are restricted by salon settings");
+        error.status = 400;
+        throw error;
+      }
+      const taxPct = toAmount(item.taxPct || 0);
+      const preTax = unitPrice * qty;
+      itemDrafts.push({
+        itemType,
+        productId: product.id,
+        staffUserSalonId: null,
+        serviceName: item.productName || product.name,
+        staffName: item.staffName || null,
+        variationName: item.variationName || null,
+        qty,
+        unitPrice,
+        taxPct,
+        lineTotal: inclusiveTax && taxPct > 0
+          ? preTax
+          : preTax + (preTax * taxPct) / 100,
+        commissionAmount: 0,
+        complimentaryRemark: null
+      });
+      continue;
+    }
+
+    if (itemType === "MEMBERSHIP") {
+      let plan;
+      if (item.isCustom || item.membershipPlanId === "CUSTOM") {
+        plan = await prisma.membershipPlan.create({
+          data: {
+            salonId,
+            name: item.serviceName || "Custom Membership",
+            price: toAmount(item.unitPrice),
+            validityDays: Number(item.validityDays || 30),
+            benefitType: "DISCOUNT_PERCENT",
+            discountValue: 0,
+            isPublicVisible: false,
+            isActive: true
+          }
+        });
+        if (item.customServices && item.customServices.length > 0) {
+          await prisma.membershipPlanService.createMany({
+            data: item.customServices.map(sid => ({ membershipPlanId: plan.id, serviceId: typeof sid === 'string' ? sid : (sid.id || sid.serviceId) }))
+          });
+        }
+      } else {
+        plan = await ensureMembershipPlan(salonId, item.membershipPlanId);
+      }
+      const qty = 1;
+      const taxPct = toAmount(item.taxPct || 0);
+      const preTax = toAmount(plan.price) * qty;
+      itemDrafts.push({
+        itemType,
+        membershipPlanId: plan.id,
+        staffUserSalonId: item.staffUserId || null,
+        serviceName: plan.name,
+        staffName: item.staffName || null,
+        qty,
+        unitPrice: toAmount(plan.price),
+        taxPct,
+        lineTotal: preTax + (preTax * taxPct) / 100,
+        commissionAmount: 0,
+        complimentaryRemark: null
+      });
+      continue;
+    }
+
+    if (itemType === "PACKAGE") {
+      let pack;
+      if (item.isCustom || item.packageId === "CUSTOM") {
+        pack = await prisma.package.create({
+          data: {
+            salonId,
+            name: item.serviceName || "Custom Package",
+            price: toAmount(item.unitPrice),
+            totalSessions: item.customServices ? item.customServices.length : 1,
+            validityDays: Number(item.validityDays || 30),
+            isPublicVisible: false,
+            isActive: true
+          }
+        });
+        if (item.customServices && item.customServices.length > 0) {
+          await prisma.packageService.createMany({
+            data: item.customServices.map(sid => ({ packageId: pack.id, serviceId: typeof sid === 'string' ? sid : (sid.id || sid.serviceId), sessions: typeof sid === 'object' ? Number(sid.qty || sid.sessions || 1) : 1 }))
+          });
+        }
+      } else {
+        pack = await ensurePackagePlan(salonId, item.packageId);
+      }
+      const qty = 1;
+      const taxPct = toAmount(item.taxPct || 0);
+      const preTax = toAmount(pack.price) * qty;
+      itemDrafts.push({
+        itemType,
+        packageId: pack.id,
+        staffUserSalonId: item.staffUserId || null,
+        serviceName: pack.name,
+        staffName: item.staffName || null,
+        qty,
+        unitPrice: toAmount(pack.price),
+        taxPct,
+        lineTotal: preTax + (preTax * taxPct) / 100,
+        commissionAmount: 0,
+        complimentaryRemark: null
+      });
+
+      if (item.customProducts && item.customProducts.length > 0) {
+        for (const cp of item.customProducts) {
+          const product = await prisma.product.findUnique({ where: { id: cp.productId || cp.id } });
+          if (product) {
+            itemDrafts.push({
+              itemType: "PRODUCT",
+              productId: product.id,
+              staffUserSalonId: item.staffUserId || null,
+              serviceName: `[Package: ${pack.name}] ${product.name}`,
+              staffName: item.staffName || null,
+              qty: Number(cp.qty || 1),
+              unitPrice: 0,
+              taxPct: 0,
+              lineTotal: 0,
+              commissionAmount: 0,
+              complimentaryRemark: null
+            });
+          }
+        }
+      }
+    }
+
+    if (itemType === "GIFT_CARD") {
+      const gcAmount = toAmount(item.unitPrice);
+      const validityDays = Number(item.validityDays || 365);
+      const qty = Number(item.qty || 1);
+      const taxPct = toAmount(item.taxPct || 0);
+      const preTax = gcAmount * qty;
+      itemDrafts.push({
+        itemType,
+        serviceName: item.serviceName || "Gift Card",
+        staffName: item.staffName || null,
+        qty,
+        unitPrice: gcAmount,
+        taxPct,
+        lineTotal: preTax + (preTax * taxPct) / 100,
+        commissionAmount: 0,
+        complimentaryRemark: null,
+        validityDays,
+        gcCode: item.gcCode || null
+      });
+    }
+  }
+
+  const soldMembershipCount = itemDrafts.filter((item) => item.itemType === "MEMBERSHIP").length;
+  if (soldMembershipCount > 0 && membershipSettings.allowMultipleActivePlans === false) {
+    if (soldMembershipCount > 1) {
+      const error = new Error("Only one membership can be sold in a single invoice when multiple active plans are disabled");
+      error.status = 400;
+      throw error;
+    }
+    const existingActiveMembership = await prisma.customerMembership.findFirst({
+      where: {
+        salonId,
+        customerId: body.customerId,
+        status: "ACTIVE",
+        endsAt: { gte: new Date() }
+      },
+      include: { membershipPlan: true }
+    });
+    if (existingActiveMembership) {
+      const error = new Error(`Customer already has an active membership: ${existingActiveMembership.membershipPlan?.name || "membership"}`);
+      error.status = 400;
+      throw error;
+    }
+  }
+
+  const subtotal = itemDrafts.reduce((sum, item) => sum + toAmount(item.unitPrice) * Number(item.qty || 1), 0);
+  const lineTax = inclusiveTax
+    ? itemDrafts.reduce((sum, item) => {
+        const preTax = toAmount(item.unitPrice) * Number(item.qty || 1);
+        const taxPct = toAmount(item.taxPct);
+        return sum + (taxPct > 0 ? (preTax * taxPct) / (100 + taxPct) : 0);
+      }, 0)
+    : itemDrafts.reduce((sum, item) => sum + ((toAmount(item.unitPrice) * Number(item.qty || 1)) * toAmount(item.taxPct)) / 100, 0);
+  const manualDiscount = toAmount(body.discount);
+  const extraTax = toAmount(body.tax);
+  let coupon = null;
+  let couponDiscount = 0;
+  if (body.couponCode) {
+    coupon = await prisma.coupon.findFirst({
+      where: { salonId, code: body.couponCode, isArchived: false }
+    });
+    if (!coupon) {
+      const error = new Error("Coupon not found");
+      error.status = 404;
+      throw error;
+    }
+    const now = new Date();
+    if (coupon.startsAt && new Date(coupon.startsAt) > now) {
+      const error = new Error("Coupon is not active yet");
+      error.status = 400;
+      throw error;
+    }
+    if (coupon.endsAt && new Date(coupon.endsAt) < now) {
+      const error = new Error("Coupon has expired");
+      error.status = 400;
+      throw error;
+    }
+    if (coupon.usageLimit != null && coupon.usageCount >= coupon.usageLimit) {
+      const error = new Error("Coupon usage limit reached");
+      error.status = 400;
+      throw error;
+    }
+    if (coupon.minBillAmount != null && subtotal < toAmount(coupon.minBillAmount)) {
+      const error = new Error("Minimum bill amount not reached for this coupon");
+      error.status = 400;
+      throw error;
+    }
+    if (coupon.branchId && coupon.branchId !== body.branchId) {
+      const error = new Error("Coupon is not valid for this branch");
+      error.status = 400;
+      throw error;
+    }
+    if (coupon.serviceId && !itemDrafts.some((item) => item.serviceId === coupon.serviceId)) {
+      const error = new Error("Coupon is not valid for the selected services");
+      error.status = 400;
+      throw error;
+    }
+    if (coupon.productId && !itemDrafts.some((item) => item.productId === coupon.productId)) {
+      const error = new Error("Coupon is not valid for the selected products");
+      error.status = 400;
+      throw error;
+    }
+    if (body.customerId && coupon.customerUsageLimit != null) {
+      const used = await prisma.couponRedemption.count({
+        where: { couponId: coupon.id, customerId: body.customerId }
+      });
+      if (used >= coupon.customerUsageLimit) {
+        const error = new Error("Customer usage limit reached for this coupon");
+        error.status = 400;
+        throw error;
+      }
+    }
+    couponDiscount = coupon.discountType === "PERCENT"
+      ? Math.min(subtotal, subtotal * (toAmount(coupon.discountValue) / 100))
+      : Math.min(subtotal, toAmount(coupon.discountValue));
+  }
+
+  let referralCouponEligibleServiceIds = [];
+  let referralCouponEligibleCategoryIds = [];
+  let partnerCreditsEarned = 0;
+
+  if (coupon && coupon.isReferral) {
+    const couponWithScope = await prisma.coupon.findUnique({
+      where: { id: coupon.id },
+      include: {
+        eligibleCategories: true,
+        eligibleServices: true,
+      },
+    });
+    referralCouponEligibleServiceIds = couponWithScope.eligibleServices.map((e) => e.serviceId);
+    referralCouponEligibleCategoryIds = couponWithScope.eligibleCategories.map((e) => e.categoryId);
+
+    const hasServiceScope = referralCouponEligibleServiceIds.length > 0;
+    const hasCategoryScope = referralCouponEligibleCategoryIds.length > 0;
+    const isGlobal = !hasServiceScope && !hasCategoryScope;
+    let eligibleSubtotal = 0;
+
+    for (const item of itemDrafts) {
+      let isEligible = isGlobal;
+      if (!isEligible && item.serviceId) {
+        isEligible = referralCouponEligibleServiceIds.includes(item.serviceId);
+        if (!isEligible && hasCategoryScope && item.categoryId) {
+          isEligible = referralCouponEligibleCategoryIds.includes(item.categoryId);
+        }
+      }
+      if (isEligible) {
+        const lineTotal = toAmount(item.unitPrice) * Number(item.qty || 1);
+        eligibleSubtotal += lineTotal;
+        if (coupon.partnerCreditType && coupon.partnerCreditValue != null) {
+          const credits = coupon.partnerCreditType === "PERCENT"
+            ? Math.min(lineTotal, lineTotal * (toNumber(coupon.partnerCreditValue) / 100))
+            : toNumber(coupon.partnerCreditValue);
+          partnerCreditsEarned += credits;
+        }
+      }
+    }
+
+    if (eligibleSubtotal <= 0) {
+      const error = new Error("Coupon is not valid for the selected services");
+      error.status = 400;
+      throw error;
+    }
+
+    couponDiscount = coupon.discountType === "PERCENT"
+      ? Math.min(eligibleSubtotal, eligibleSubtotal * (toAmount(coupon.discountValue) / 100))
+      : Math.min(eligibleSubtotal, toAmount(coupon.discountValue));
+  }
+
+  const loyaltyRule = body.loyaltyPointsUsed
+    ? await prisma.loyaltyRule.findFirst({
+        where: { salonId, isActive: true, OR: [{ branchId: body.branchId || null }, { branchId: null }] },
+        orderBy: [{ branchId: "desc" }, { updatedAt: "desc" }]
+      })
+    : null;
+  const loyaltyBalance = body.loyaltyPointsUsed ? await getCustomerValidLoyaltyBalance(body.customerId) : 0;
+  let loyaltyDiscount = 0;
+  if (Number(body.loyaltyPointsUsed || 0) > 0) {
+    if (!loyaltyRule) {
+      const error = new Error("No active loyalty rule found");
+      error.status = 400;
+      throw error;
+    }
+    const requestedPoints = Math.max(0, Number(body.loyaltyPointsUsed || 0));
+    if (requestedPoints > loyaltyBalance) {
+      const error = new Error("Customer does not have enough loyalty points");
+      error.status = 400;
+      throw error;
+    }
+    if (requestedPoints < Number(loyaltyRule.minRedeemPoints || 0)) {
+      const error = new Error("Minimum loyalty redeem points not reached");
+      error.status = 400;
+      throw error;
+    }
+    const subtotalAfterCoupon = Math.max(0, subtotal - manualDiscount - couponDiscount);
+    let redeemPointsPerRupee;
+    try {
+      const notes = JSON.parse(loyaltyRule.notes || "{}");
+      const rPts = Number(notes.redeemPoints || 0);
+      const rAmt = toNumber(notes.redeemAmount || 0);
+      redeemPointsPerRupee = rAmt > 0 ? rPts / rAmt : null;
+    } catch { redeemPointsPerRupee = null; }
+    const pointsPerCurrency = redeemPointsPerRupee || toNumber(loyaltyRule.pointsPerCurrency) || 1;
+    const pointsToCurrency = requestedPoints / pointsPerCurrency;
+    let maxRedeemAmount = loyaltyRule.maxRedeemPercent != null
+      ? (subtotalAfterCoupon * toAmount(loyaltyRule.maxRedeemPercent)) / 100
+      : subtotalAfterCoupon;
+    try {
+      const notes = JSON.parse(loyaltyRule.notes || "{}");
+      const maxPts = Number(notes.maxRedeemPoints || 0);
+      if (maxPts > 0) {
+        const maxFromPts = maxPts / pointsPerCurrency;
+        maxRedeemAmount = Math.min(maxRedeemAmount, maxFromPts);
+      }
+    } catch {}
+    loyaltyDiscount = Math.min(pointsToCurrency, maxRedeemAmount, subtotalAfterCoupon);
+  }
+
+  let giftCard = null;
+  let giftCardPayment = 0;
+  if (body.giftVoucherCode) {
+    giftCard = await prisma.giftCard.findFirst({
+      where: {
+        salonId,
+        code: body.giftVoucherCode,
+        isActive: true,
+        ...(body.customerId ? { OR: [{ issuedToCustomerId: body.customerId }, { issuedToCustomerId: null }] } : {})
+      }
+    });
+    if (!giftCard) {
+      const error = new Error("Gift card not found");
+      error.status = 404;
+      throw error;
+    }
+    if (giftCard.expiresAt && new Date(giftCard.expiresAt) < new Date()) {
+      const error = new Error("Gift card has expired");
+      error.status = 400;
+      throw error;
+    }
+    giftCardPayment = Math.min(
+      Math.max(0, subtotal + lineTax + extraTax - manualDiscount - couponDiscount - loyaltyDiscount),
+      toAmount(giftCard.balanceAmount)
+    );
+  }
+
+  const discount = manualDiscount + couponDiscount + loyaltyDiscount;
+  const total = Math.max(0, subtotal + lineTax + extraTax - discount);
+  const affiliateCreditRedemptions = (body.affiliateCreditRedemptions || [])
+    .map((row) => ({
+      partnerId: row.partnerId,
+      amount: toAmount(row.amount),
+      credits: toAmount(row.credits) || (toAmount(row.amount) / affiliateServiceCreditValue),
+      note: row.note || "Affiliate service credit redeemed"
+    }))
+    .filter((row) => row.partnerId && row.amount > 0 && row.credits > 0);
+  const affiliateCreditPayment = affiliateCreditRedemptions.reduce((sum, row) => sum + row.amount, 0);
+  if (affiliateCreditPayment > Math.max(0, total - giftCardPayment) + 0.01) {
+    const error = new Error("Affiliate credit redemption exceeds payable invoice amount");
+    error.status = 400;
+    throw error;
+  }
+  const autoPayments = giftCardPayment > 0
+    ? [{ mode: "WALLET", amount: giftCardPayment, note: `Gift card ${body.giftVoucherCode}`, type: "PAYMENT" }]
+    : [];
+  affiliateCreditRedemptions.forEach((row) => {
+    autoPayments.push({
+      mode: "WALLET",
+      amount: row.amount,
+      note: `Affiliate credits from partner ${row.partnerId}: ${row.note}`,
+      type: "PAYMENT"
+    });
+  });
+  const membershipWalletTotal = itemDrafts.reduce((sum, item) => sum + toAmount(item.membershipWalletUsed), 0);
+  const hasExplicitMembershipWalletPayment = (body.payments || []).some((p) => p.mode === "WALLET");
+  if (membershipWalletTotal > 0 && !hasExplicitMembershipWalletPayment) {
+    autoPayments.push({
+      mode: "WALLET",
+      amount: membershipWalletTotal,
+      note: `Membership wallet applied: ${membership?.membershipPlan?.name || "Membership"}`,
+      type: "PAYMENT"
+    });
+  }
+  const allPayments = [...autoPayments, ...(body.payments || [])];
+  const initialPaidAmount = allPayments
+    .filter(p => p.mode !== "BALANCE")
+    .reduce((sum, payment) => sum + toAmount(payment.amount), 0);
+
+  return prisma.$transaction(async (tx) => {
+    const invoiceNumber = await createInvoiceNumber(tx, salonId, body.branchId || null);
+    const invoice = await tx.invoice.create({
+      data: {
+        salonId,
+        branchId: body.branchId || null,
+        customerId: body.customerId,
+        appointmentId: body.appointmentId || null,
+        invoiceNumber,
+        status: body.mode === "start" ? "STARTED" : normalizeStatus(initialPaidAmount, total),
+        startedAt: body.mode === "start" ? new Date() : null,
+        subtotal,
+        discount,
+        tax: lineTax + extraTax,
+        total,
+        paidAmount: initialPaidAmount,
+        balanceAmount: Math.max(0, total - initialPaidAmount),
+        notes: buildInvoiceNotes(body),
+        couponCode: coupon?.code || null,
+        giftVoucherCode: giftCard?.code || null,
+        loyaltyPointsUsed: loyaltyDiscount > 0 ? Number(body.loyaltyPointsUsed || 0) : null,
+        referralCode: coupon?.isReferral ? coupon.code : null,
+        partnerCreditsEarned: partnerCreditsEarned > 0 ? partnerCreditsEarned : null,
+        items: {
+          create: itemDrafts.map((item) => ({
+            serviceName: item.serviceName,
+            staffName: item.staffName,
+            variationName: item.variationName || null,
+            qty: item.qty,
+            unitPrice: item.unitPrice,
+            taxPct: item.taxPct,
+            lineTotal: item.lineTotal,
+            itemType: item.itemType,
+            appliedBenefitType: item.appliedBenefitType || null,
+            appliedBenefitValue: item.appliedBenefitValue || null,
+            membershipWalletUsed: item.membershipWalletUsed || null,
+            commissionAmount: item.commissionAmount || null,
+            complimentaryRemark: item.complimentaryRemark || null,
+            consumableData: Array.isArray(item.consumableItems) && item.consumableItems.length > 0 ? item.consumableItems : null,
+            ...(item.serviceId ? { serviceId: item.serviceId } : {}),
+            ...(item.productId ? { product: { connect: { id: item.productId } } } : {}),
+            ...(item.membershipPlanId ? { membershipPlan: { connect: { id: item.membershipPlanId } } } : {}),
+            ...(item.packageId ? { package: { connect: { id: item.packageId } } } : {}),
+            ...(item.staffUserSalonId ? { staffUserSalon: { connect: { id: item.staffUserSalonId } } } : {})
+          }))
+        }
+      },
+      include: { items: true }
+    });
+
+    const isStartMode = body.mode === "start";
+
+    if (!isStartMode) {
+    await createPaymentRows(tx, salonId, invoice.id, allPayments.filter(p => p.mode !== "BALANCE"), body.customerId);
+
+    const finalInvoice = await tx.invoice.findUnique({ where: { id: invoice.id } });
+    if (finalInvoice && normalizeStatus(toAmount(finalInvoice.paidAmount), toAmount(finalInvoice.total)) === "PAID") {
+      await tx.invoice.update({ where: { id: invoice.id }, data: { completedAt: new Date() } });
+    }
+
+    for (const redemption of affiliateCreditRedemptions) {
+      const wallet = await tx.affiliateCreditWallet.findUnique({
+        where: { salonId_partnerId: { salonId, partnerId: redemption.partnerId } }
+      });
+      if (!wallet) {
+        throw Object.assign(new Error("Affiliate wallet not found"), { status: 404 });
+      }
+      if (toAmount(wallet.balance) < redemption.credits) {
+        throw Object.assign(
+          new Error(`Insufficient affiliate credits. Available: ${wallet.balance}, requested: ${redemption.credits}`),
+          { status: 400 }
+        );
+      }
+      const updatedWallet = await tx.affiliateCreditWallet.update({
+        where: { id: wallet.id },
+        data: {
+          balance: { decrement: redemption.credits },
+          totalRedeemed: { increment: redemption.credits }
+        }
+      });
+      await tx.affiliateCreditTransaction.create({
+        data: {
+          salonId,
+          walletId: wallet.id,
+          type: "REDEEM_SERVICE",
+          amount: redemption.credits,
+          invoiceId: invoice.id,
+          note: `${redemption.note}; service discount ${redemption.amount}; balance after ${updatedWallet.balance}`
+        }
+      });
+    }
+
+    for (const item of itemDrafts) {
+      if (item.itemType === "PRODUCT") {
+        await createStockMovement(tx, {
+          salonId,
+          branchId: body.branchId || null,
+          productId: item.productId,
+          quantity: -Number(item.qty || 1),
+          movementType: "POS_SALE",
+          createdByUserId: actorUser.id,
+          referenceType: "INVOICE",
+          referenceId: invoice.id
+        });
+      }
+
+      // Skip auto-creation of customerMembership / customerPackage when the caller
+      // (e.g. /memberships/assign) has already created the row and only needs
+      // the invoice/payment side of the flow. Otherwise we'd end up with duplicates.
+      if (item.itemType === "MEMBERSHIP" && !body.skipMembershipCreation) {
+        const plan = await tx.membershipPlan.findUnique({ where: { id: item.membershipPlanId } });
+        const startsAt = new Date();
+        const endsAt = new Date(startsAt.getTime() + Number(plan.validityDays) * 24 * 60 * 60 * 1000);
+        await tx.customerMembership.create({
+          data: {
+            salonId,
+            customerId: body.customerId,
+            membershipPlanId: plan.id,
+            soldInvoiceId: invoice.id,
+            startsAt,
+            endsAt,
+            remainingWalletValue: plan.benefitType === "WALLET_VALUE" ? plan.walletValue : null
+          }
+        });
+      }
+
+      if (item.itemType === "PACKAGE" && !body.skipMembershipCreation) {
+        const pack = await tx.package.findUnique({ where: { id: item.packageId } });
+        const startsAt = new Date();
+        const endsAt = new Date(startsAt.getTime() + Number(pack.validityDays) * 24 * 60 * 60 * 1000);
+        await tx.customerPackage.create({
+          data: {
+            salonId,
+            customerId: body.customerId,
+            packageId: pack.id,
+            soldInvoiceId: invoice.id,
+            startsAt,
+            endsAt,
+            remainingSessions: Number(pack.totalSessions)
+          }
+        });
+      }
+
+      if (item.itemType === "GIFT_CARD") {
+        const gcAmount = toAmount(item.unitPrice);
+        const validityDays = Number(item.validityDays || 365);
+        const expiresAt = new Date();
+        expiresAt.setDate(expiresAt.getDate() + validityDays);
+        const gcCode = item.gcCode || `GC-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString("hex").toUpperCase()}`;
+        const gcTitle = item.serviceName || "Gift Card";
+        await tx.giftCard.create({
+          data: {
+            salonId,
+            issuedToCustomerId: body.customerId || null,
+            soldInvoiceId: invoice.id,
+            createdByMembershipId: actorUser.membershipId || null,
+            code: gcCode,
+            title: gcTitle,
+            originalAmount: gcAmount,
+            balanceAmount: gcAmount,
+            expiresAt,
+            isActive: true,
+            note: item.note || null
+          }
+        });
+      }
+    }
+
+    for (const item of itemDrafts) {
+      if (item.itemType === "SERVICE" && item.serviceId) {
+        const svc = await tx.service.findUnique({ where: { id: item.serviceId }, include: { consumables: { include: { product: true } } } });
+        if (svc && svc.consumables && svc.consumables.length > 0) {
+          const serviceVariation = item.variation || null;
+          const matchedConsumables = svc.consumables.filter(c => c.variation === serviceVariation || (serviceVariation == null && c.variation == null));
+          for (const cons of matchedConsumables.length > 0 ? matchedConsumables : svc.consumables.filter(c => c.variation == null)) {
+            const overrideKey = `${item.serviceId}:${cons.productId}`;
+            const overrideQty = body.consumableOverrides?.[overrideKey];
+            const rawQty = overrideQty != null ? Number(overrideQty) : Number(cons.reqdQty);
+            const qtyToDeduct = convertConsumableQty(rawQty, cons.product);
+            if (qtyToDeduct > 0) {
+              await createStockMovement(tx, {
+                salonId,
+                branchId: body.branchId || null,
+                productId: cons.productId,
+                quantity: -qtyToDeduct * Number(item.qty || 1),
+                movementType: "CONSUMABLE_USAGE",
+                createdByUserId: actorUser.id,
+                referenceType: "INVOICE",
+                referenceId: invoice.id,
+                note: overrideQty != null ? `Override: ${overrideQty} ${cons.product?.unit || ""} (default: ${cons.reqdQty})` : null,
+                allowNegativeStock: true
+              });
+            }
+          }
+        }
+        if (Array.isArray(item.consumableItems) && item.consumableItems.length > 0) {
+          for (const ci of item.consumableItems) {
+            if (ci.productId && Number(ci.qty) > 0) {
+              await createStockMovement(tx, {
+                salonId,
+                branchId: body.branchId || null,
+                productId: ci.productId,
+                quantity: -Number(ci.qty) * Number(item.qty || 1),
+                movementType: "CONSUMABLE_USAGE",
+                createdByUserId: actorUser.id,
+                referenceType: "INVOICE",
+                referenceId: invoice.id,
+                note: `Custom consumable: ${ci.name || ""} (${ci.qty} ${ci.unit || ""})`,
+                allowNegativeStock: true
+              });
+            }
+          }
+        }
+      }
+    }
+
+    if (membership) {
+      const walletUsed = itemDrafts.reduce((sum, item) => sum + toAmount(item.membershipWalletUsed), 0);
+      if (walletUsed > 0) {
+        await tx.customerMembership.update({
+          where: { id: membership.id },
+          data: { remainingWalletValue: Math.max(0, toAmount(membership.remainingWalletValue) - walletUsed) }
+        });
+        await tx.membershipUsage.create({
+          data: {
+            customerMembershipId: membership.id,
+            invoiceId: invoice.id,
+            amountUsed: walletUsed,
+            note: "Applied in POS invoice"
+          }
+        });
+      }
+    }
+
+    for (const redemption of body.packageRedemptions || []) {
+      const customerPackage = await tx.customerPackage.findUnique({
+        where: { id: redemption.customerPackageId },
+        include: { package: true }
+      });
+      if (!customerPackage || customerPackage.status !== "ACTIVE") {
+        throw Object.assign(new Error("Customer package not found or not active"), { status: 400 });
+      }
+      const sessionsUsed = Number(redemption.sessionsUsed || 1);
+      if (customerPackage.remainingSessions < sessionsUsed) {
+        const error = new Error(`Package ${customerPackage.package.name} does not have enough sessions`);
+        error.status = 400;
+        throw error;
+      }
+      await tx.customerPackage.update({
+        where: { id: customerPackage.id },
+        data: {
+          remainingSessions: customerPackage.remainingSessions - sessionsUsed,
+          status: customerPackage.remainingSessions - sessionsUsed <= 0 ? "FULLY_USED" : customerPackage.status
+        }
+      });
+      await tx.packageUsage.create({
+        data: {
+          customerPackageId: customerPackage.id,
+          invoiceId: invoice.id,
+          serviceId: redemption.serviceId,
+          sessionsUsed,
+          note: redemption.note || "Redeemed in POS"
+        }
+      });
+    }
+
+    if (coupon && couponDiscount > 0) {
+      const freshCoupon = await tx.coupon.findUnique({ where: { id: coupon.id } });
+      if (freshCoupon.usageLimit != null && freshCoupon.usageCount >= freshCoupon.usageLimit) {
+        throw Object.assign(new Error("Coupon usage limit reached (concurrent use detected)"), { status: 400 });
+      }
+      await tx.couponRedemption.create({
+        data: {
+          salonId,
+          couponId: coupon.id,
+          customerId: body.customerId,
+          invoiceId: invoice.id,
+          amountSaved: couponDiscount,
+          partnerCreditsEarned: partnerCreditsEarned > 0 ? partnerCreditsEarned : null,
+        }
+      });
+      await tx.coupon.update({
+        where: { id: coupon.id },
+        data: { usageCount: { increment: 1 } }
+      });
+    }
+
+    if (coupon && coupon.isReferral && partnerCreditsEarned > 0) {
+      const referralCouponFull = await tx.coupon.findUnique({ where: { id: coupon.id } });
+      if (referralCouponFull && referralCouponFull.partnerCustomerId) {
+        const wallet = await tx.affiliateCreditWallet.upsert({
+          where: { salonId_partnerId: { salonId, partnerId: referralCouponFull.partnerCustomerId } },
+          create: { salonId, partnerId: referralCouponFull.partnerCustomerId, balance: partnerCreditsEarned, totalEarned: partnerCreditsEarned, totalRedeemed: 0 },
+          update: { balance: { increment: partnerCreditsEarned }, totalEarned: { increment: partnerCreditsEarned } },
+        });
+        await tx.affiliateCreditTransaction.create({
+          data: {
+            salonId,
+            walletId: wallet.id,
+            type: "EARN",
+            amount: partnerCreditsEarned,
+            invoiceId: invoice.id,
+            note: `Earned from coupon ${coupon.code} on invoice ${invoice.invoiceNumber}`,
+          },
+        });
+        try {
+          await tx.referralCode.upsert({
+            where: { salonId_code: { salonId, code: coupon.code } },
+            create: { salonId, customerId: referralCouponFull.partnerCustomerId, code: coupon.code, refereeId: body.customerId || null, redeemedAt: new Date(), status: "REDEEMED", referrerReward: partnerCreditsEarned, refereeReward: 0 },
+            update: { refereeId: body.customerId || undefined, redeemedAt: new Date(), status: "REDEEMED" },
+          });
+        } catch (_) {}
+        try {
+          const partnerName = referralCouponFull.title || "Partner";
+          await tx.customerNotification.create({
+            data: {
+              salonId,
+              customerId: referralCouponFull.partnerCustomerId,
+              title: "Credits Earned!",
+              message: `You earned ${Number(partnerCreditsEarned).toFixed(1)} credits from referral coupon ${coupon.code}. Invoice: ${invoice.invoiceNumber}`,
+              linkUrl: `/admin/referral-program`,
+            },
+          });
+        } catch (_) {}
+      }
+    }
+
+    if (giftCard && giftCardPayment > 0) {
+      await tx.giftCard.update({
+        where: { id: giftCard.id },
+        data: { balanceAmount: Math.max(0, toAmount(giftCard.balanceAmount) - giftCardPayment) }
+      });
+      await tx.giftCardRedemption.create({
+        data: {
+          salonId,
+          giftCardId: giftCard.id,
+          customerId: body.customerId,
+          invoiceId: invoice.id,
+          amountUsed: giftCardPayment
+        }
+      });
+    }
+
+    const currentCustomer = await tx.customer.findUnique({
+      where: { id: body.customerId },
+      select: { loyaltyPoints: true }
+    });
+    let runningLoyaltyBalance = Number(currentCustomer?.loyaltyPoints || 0);
+    if (loyaltyDiscount > 0) {
+      const redeemedPoints = Number(body.loyaltyPointsUsed || 0);
+      if (runningLoyaltyBalance < redeemedPoints) {
+        throw Object.assign(new Error("Insufficient loyalty points (concurrent redemption detected)"), { status: 400 });
+      }
+      runningLoyaltyBalance -= redeemedPoints;
+      await tx.customer.update({
+        where: { id: body.customerId },
+        data: { loyaltyPoints: runningLoyaltyBalance }
+      });
+      await tx.loyaltyTransaction.create({
+        data: {
+          salonId,
+          branchId: body.branchId || null,
+          customerId: body.customerId,
+          invoiceId: invoice.id,
+          createdByMembershipId: actorUser.membershipId || null,
+          type: "REDEEM",
+          points: -redeemedPoints,
+          balanceAfter: runningLoyaltyBalance,
+          note: `Redeemed on invoice ${invoice.invoiceNumber}`
+        }
+      });
+    }
+
+    const earnedPoints = calculateLoyaltyEarnPoints({
+      rule: loyaltyRule,
+      invoiceSubtotal: Math.max(0, subtotal - discount),
+      items: itemDrafts
+    });
+    if (earnedPoints > 0 && loyaltyRule) {
+      const skipEarnOnRedemption = (() => {
+        try { return JSON.parse(loyaltyRule.notes || "{}").skipEarnOnRedemption === true; } catch { return false; }
+      })();
+      const isRedeeming = Number(body.loyaltyPointsUsed || 0) > 0;
+      if (!(skipEarnOnRedemption && isRedeeming)) {
+        runningLoyaltyBalance += earnedPoints;
+        const expiresAt = loyaltyRule.expiryDays
+          ? new Date(Date.now() + Number(loyaltyRule.expiryDays) * 24 * 60 * 60 * 1000)
+          : null;
+        await tx.customer.update({
+          where: { id: body.customerId },
+          data: { loyaltyPoints: runningLoyaltyBalance }
+        });
+        await tx.loyaltyTransaction.create({
+          data: {
+            salonId,
+            branchId: body.branchId || null,
+            customerId: body.customerId,
+            invoiceId: invoice.id,
+            createdByMembershipId: actorUser.membershipId || null,
+            type: "EARN",
+            points: earnedPoints,
+            balanceAfter: runningLoyaltyBalance,
+            expiresAt,
+            note: `Earned from invoice ${invoice.invoiceNumber}`
+          }
+        });
+      }
+    }
+
+    if (loyaltyRule && Number(loyaltyRule.birthdayPoints || 0) > 0) {
+      const customer = await tx.customer.findUnique({ where: { id: body.customerId }, select: { dateOfBirth: true } });
+      if (customer?.dateOfBirth) {
+        const today = new Date();
+        const dob = new Date(customer.dateOfBirth);
+        if (dob.getUTCDate() === today.getUTCDate() && dob.getUTCMonth() === today.getUTCMonth()) {
+          const bdayPoints = Number(loyaltyRule.birthdayPoints);
+          runningLoyaltyBalance += bdayPoints;
+          const expiresAt = loyaltyRule.expiryDays
+            ? new Date(Date.now() + Number(loyaltyRule.expiryDays) * 24 * 60 * 60 * 1000)
+            : null;
+          await tx.customer.update({
+            where: { id: body.customerId },
+            data: { loyaltyPoints: runningLoyaltyBalance }
+          });
+          await tx.loyaltyTransaction.create({
+            data: {
+              salonId,
+              branchId: body.branchId || null,
+              customerId: body.customerId,
+              invoiceId: invoice.id,
+              createdByMembershipId: actorUser.membershipId || null,
+              type: "BONUS",
+              points: bdayPoints,
+              balanceAfter: runningLoyaltyBalance,
+              expiresAt,
+              note: `Birthday bonus for ${customer.dateOfBirth.toISOString().slice(0, 10)}`
+            }
+          });
+        }
+      }
+    }
+
+    if (body.appointmentId) {
+      await tx.appointment.update({
+        where: { id: body.appointmentId },
+        data: { convertedInvoiceId: invoice.id }
+      });
+    }
+    } // end !isStartMode
+
+    if (isStartMode && body.appointmentId) {
+      await tx.appointment.update({
+        where: { id: body.appointmentId },
+        data: { convertedInvoiceId: invoice.id }
+      }).catch(() => {});
+    }
+
+    await logCustomerTimeline(tx, body.customerId, "INVOICE", "POS invoice created", invoice.invoiceNumber, invoice.id);
+    await refreshCustomerInsights(tx, body.customerId);
+    return tx.invoice.findUnique({
+      where: { id: invoice.id },
+      include: { items: true, customer: true, branch: true, payments: true }
+    });
+  }, { timeout: 30000 });
+};
+
+export const addInvoicePayment = async ({ salonId, invoiceId, amount, mode, note, actorUser }) => {
+  if (mode === "BALANCE") {
+    const error = new Error("BALANCE is not a valid payment mode");
+    error.status = 400;
+    throw error;
+  }
+  return prisma.$transaction(async (tx) => {
+    const invoice = await tx.invoice.findFirst({
+      where: { id: invoiceId, salonId },
+      include: { payments: true }
+    });
+    if (!invoice) {
+      const error = new Error("Invoice not found");
+      error.status = 404;
+      throw error;
+    }
+    if (["CANCELLED", "REFUNDED"].includes(invoice.status)) {
+      const error = new Error("This invoice cannot accept more payments");
+      error.status = 400;
+      throw error;
+    }
+    const nextPaid = toAmount(invoice.paidAmount) + toAmount(amount);
+    if (nextPaid > toAmount(invoice.total)) {
+      const error = new Error("Payment exceeds invoice total");
+      error.status = 400;
+      throw error;
+    }
+    if (mode === "WALLET") {
+      const customerId = invoice.customerId;
+      if (!customerId) {
+        const error = new Error("Cannot pay via wallet for guest checkout");
+        error.status = 400;
+        throw error;
+      }
+      const wallet = await tx.wallet.findUnique({
+        where: { salonId_customerId: { salonId, customerId } }
+      });
+      if (!wallet || Number(wallet.balance) < toAmount(amount)) {
+        const err = new Error(`Insufficient wallet balance. Available: ₹${Number(wallet?.balance || 0).toFixed(2)}, Required: ₹${toAmount(amount).toFixed(2)}`);
+        err.status = 400;
+        throw err;
+      }
+      const updatedWallet = await tx.wallet.update({
+        where: { id: wallet.id },
+        data: {
+          balance: { decrement: toAmount(amount) },
+          totalUsed: { increment: toAmount(amount) }
+        }
+      });
+      await tx.walletTransaction.create({
+        data: {
+          salonId,
+          walletId: wallet.id,
+          customerId,
+          type: "POS_PAYMENT",
+          amount: toAmount(amount),
+          balanceAfter: updatedWallet.balance,
+          referenceId: invoice.id,
+          note: `POS invoice balance payment (${invoice.id})`
+        }
+      });
+    }
+
+    const payment = await tx.payment.create({
+      data: {
+        salonId,
+        invoiceId: invoice.id,
+        amount: toAmount(amount),
+        mode,
+        note: note || null,
+        type: ["PARTIAL", "UNPAID"].includes(invoice.status) ? "BALANCE" : "PAYMENT"
+      }
+    });
+    const nextStatus = normalizeStatus(nextPaid, toAmount(invoice.total), toAmount(invoice.refundAmount));
+    await tx.invoice.update({
+      where: { id: invoice.id },
+      data: {
+        paidAmount: nextPaid,
+        balanceAmount: Math.max(0, toAmount(invoice.total) - nextPaid),
+        status: nextStatus,
+        ...(nextStatus === "PAID" && invoice.status !== "PAID" ? { completedAt: new Date() } : {})
+      }
+    });
+    return payment;
+  });
+};
+
+export const addInvoiceTip = async ({ salonId, invoiceId, amount, mode, note, actorUser }) => {
+  return prisma.$transaction(async (tx) => {
+    const invoice = await tx.invoice.findFirst({
+      where: { id: invoiceId, salonId }
+    });
+    if (!invoice) {
+      const error = new Error("Invoice not found");
+      error.status = 404;
+      throw error;
+    }
+    if (["CANCELLED", "REFUNDED"].includes(invoice.status)) {
+      const error = new Error("This invoice cannot accept more payments");
+      error.status = 400;
+      throw error;
+    }
+    const payment = await tx.payment.create({
+      data: {
+        salonId,
+        invoiceId: invoice.id,
+        amount: toAmount(amount),
+        mode,
+        note: note || null,
+        type: "TIP"
+      }
+    });
+    return payment;
+  });
+};
+
+export const refundInvoice = async ({ salonId, invoiceId, amount, note, actorUser }) => {
+  return prisma.$transaction(async (tx) => {
+    const invoice = await tx.invoice.findFirst({
+      where: { id: invoiceId, salonId },
+      include: { items: true, payments: true }
+    });
+    if (!invoice) {
+      const error = new Error("Invoice not found");
+      error.status = 404;
+      throw error;
+    }
+    if (toAmount(amount) > toAmount(invoice.paidAmount) - toAmount(invoice.refundAmount)) {
+      const error = new Error("Refund exceeds available paid amount");
+      error.status = 400;
+      throw error;
+    }
+
+    await tx.payment.create({
+      data: {
+        salonId,
+        invoiceId: invoice.id,
+        amount: -Math.abs(toAmount(amount)),
+        mode: "ONLINE",
+        note: note || "Refund",
+        type: "REFUND"
+      }
+    });
+
+    for (const item of invoice.items) {
+      if (item.itemType === "PRODUCT" && item.productId) {
+        await createStockMovement(tx, {
+          salonId,
+          branchId: invoice.branchId,
+          productId: item.productId,
+          quantity: Number(item.qty || 1),
+          movementType: "PRODUCT_RETURN",
+          createdByUserId: actorUser.id,
+          referenceType: "REFUND",
+          referenceId: invoice.id
+        });
+      } else if (item.itemType === "SERVICE" && item.serviceId) {
+        const svc = await tx.service.findUnique({ where: { id: item.serviceId }, include: { consumables: { include: { product: true } } } });
+        if (svc && svc.consumables && svc.consumables.length > 0) {
+          const serviceVariation = item.variation || null;
+          const matchedConsumables = svc.consumables.filter(c => c.variation === serviceVariation || (serviceVariation == null && c.variation == null));
+          for (const cons of matchedConsumables.length > 0 ? matchedConsumables : svc.consumables.filter(c => c.variation == null)) {
+            const returnQty = convertConsumableQty(Number(cons.reqdQty), cons.product) * Number(item.qty || 1);
+            if (returnQty > 0) {
+              await createStockMovement(tx, {
+                salonId,
+                branchId: invoice.branchId,
+                productId: cons.productId,
+                quantity: returnQty,
+                movementType: "PRODUCT_RETURN",
+                createdByUserId: actorUser.id,
+                referenceType: "REFUND",
+                referenceId: invoice.id
+              });
+            }
+          }
+        }
+        const customConsumables = Array.isArray(item.consumableData) ? item.consumableData : (Array.isArray(item.consumableItems) ? item.consumableItems : []);
+        for (const ci of customConsumables) {
+          if (ci.productId && Number(ci.qty) > 0) {
+            await createStockMovement(tx, {
+              salonId,
+              branchId: invoice.branchId,
+              productId: ci.productId,
+              quantity: Number(ci.qty) * Number(item.qty || 1),
+              movementType: "PRODUCT_RETURN",
+              createdByUserId: actorUser.id,
+              referenceType: "REFUND",
+              referenceId: invoice.id
+            });
+          }
+        }
+      }
+    }
+
+    const packageUsages = await tx.packageUsage.findMany({ where: { invoiceId: invoice.id } });
+    for (const usage of packageUsages) {
+      const customerPackage = await tx.customerPackage.findUnique({ where: { id: usage.customerPackageId } });
+      if (customerPackage) {
+        await tx.customerPackage.update({
+          where: { id: customerPackage.id },
+          data: {
+            remainingSessions: customerPackage.remainingSessions + usage.sessionsUsed,
+            status: "ACTIVE"
+          }
+        });
+      }
+    }
+
+    const membershipUsages = await tx.membershipUsage.findMany({ where: { invoiceId: invoice.id } });
+    for (const usage of membershipUsages) {
+      const customerMembership = await tx.customerMembership.findUnique({ where: { id: usage.customerMembershipId } });
+      if (customerMembership && usage.amountUsed) {
+        await tx.customerMembership.update({
+          where: { id: customerMembership.id },
+          data: { remainingWalletValue: toAmount(customerMembership.remainingWalletValue) + toAmount(usage.amountUsed) }
+        });
+      }
+    }
+
+    await tx.customerMembership.updateMany({
+      where: { soldInvoiceId: invoice.id },
+      data: { status: "CANCELLED" }
+    });
+    await tx.customerPackage.updateMany({
+      where: { soldInvoiceId: invoice.id },
+      data: { status: "CANCELLED" }
+    });
+
+    const giftCardRedemptions = await tx.giftCardRedemption.findMany({ where: { invoiceId: invoice.id } });
+    for (const gcRedemption of giftCardRedemptions) {
+      const giftCard = await tx.giftCard.findUnique({ where: { id: gcRedemption.giftCardId } });
+      if (giftCard) {
+        await tx.giftCard.update({
+          where: { id: giftCard.id },
+          data: { balanceAmount: toAmount(giftCard.balanceAmount) + toAmount(gcRedemption.amountUsed) }
+        });
+      }
+    }
+
+    await reverseInvoiceLoyalty(tx, invoice, actorUser);
+
+    if (invoice.referralCode && invoice.partnerCreditsEarned) {
+      const referralCoupon = await tx.coupon.findFirst({
+        where: { salonId, code: invoice.referralCode, isReferral: true },
+      });
+      if (referralCoupon && referralCoupon.partnerCustomerId) {
+        const wallet = await tx.affiliateCreditWallet.findUnique({
+          where: { salonId_partnerId: { salonId, partnerId: referralCoupon.partnerCustomerId } },
+        });
+        if (wallet) {
+          const refundProportion = toAmount(invoice.total) > 0
+            ? Math.min(1, toAmount(amount) / toAmount(invoice.total))
+            : 1;
+          const creditsToReverse = Math.min(
+            Number(invoice.partnerCreditsEarned),
+            Math.round(Number(invoice.partnerCreditsEarned) * refundProportion * 100) / 100,
+            toAmount(wallet.balance)
+          );
+          if (creditsToReverse > 0) {
+            await tx.affiliateCreditWallet.update({
+              where: { id: wallet.id },
+              data: { balance: { decrement: creditsToReverse }, totalEarned: { decrement: creditsToReverse } },
+            });
+            await tx.affiliateCreditTransaction.create({
+              data: {
+                salonId,
+                walletId: wallet.id,
+                type: "MANUAL_ADJUSTMENT",
+                amount: creditsToReverse,
+                invoiceId: invoice.id,
+                note: `Reversed from invoice ${invoice.invoiceNumber} refund (${Math.round(refundProportion * 100)}% of credits)`,
+              },
+            });
+          }
+        }
+      }
+    }
+
+    const affiliateServiceRedemptions = await tx.affiliateCreditTransaction.findMany({
+      where: { invoiceId: invoice.id, type: "REDEEM_SERVICE" }
+    });
+    for (const redemption of affiliateServiceRedemptions) {
+      const creditsToRestore = Math.round(Number(redemption.amount || 0) * (toAmount(invoice.total) > 0 ? Math.min(1, toAmount(amount) / toAmount(invoice.total)) : 1) * 100) / 100;
+      if (creditsToRestore <= 0) continue;
+      const rWallet = await tx.affiliateCreditWallet.findUnique({ where: { id: redemption.walletId } });
+      if (!rWallet) continue;
+      await tx.affiliateCreditWallet.update({
+        where: { id: redemption.walletId },
+        data: { balance: { increment: creditsToRestore }, totalRedeemed: { decrement: creditsToRestore } }
+      });
+      await tx.affiliateCreditTransaction.create({
+        data: {
+          salonId,
+          walletId: redemption.walletId,
+          type: "MANUAL_ADJUSTMENT",
+          amount: creditsToRestore,
+          invoiceId: invoice.id,
+          note: `Restored affiliate service credits from invoice ${invoice.invoiceNumber} refund`
+        }
+      });
+    }
+
+    if (invoice.couponCode) {
+      const redemption = await tx.couponRedemption.findFirst({ where: { invoiceId: invoice.id } });
+      if (redemption) {
+        await tx.couponRedemption.delete({ where: { id: redemption.id } });
+        await tx.coupon.update({
+          where: { salonId_code: { salonId, code: invoice.couponCode } },
+          data: { usageCount: { decrement: 1 } }
+        }).catch(() => {});
+      }
+    }
+
+    const nextRefundAmount = toAmount(invoice.refundAmount) + toAmount(amount);
+    const nextStatus = normalizeStatus(toAmount(invoice.paidAmount), toAmount(invoice.total), nextRefundAmount, false);
+    await tx.invoice.update({
+      where: { id: invoice.id },
+      data: {
+        refundAmount: nextRefundAmount,
+        balanceAmount: Math.max(0, toAmount(invoice.total) - Math.max(0, toAmount(invoice.paidAmount) - nextRefundAmount)),
+        status: nextStatus
+      }
+    });
+    await refreshCustomerInsights(tx, invoice.customerId);
+    return tx.invoice.findUnique({
+      where: { id: invoice.id },
+      include: { items: true, customer: true, branch: true, payments: true }
+    });
+  });
+};
+
+export const generatePaymentLink = async ({ salonId, invoiceId, expiresAt, gatewayName, note }) => {
+  const token = crypto.randomBytes(20).toString("hex");
+  const invoice = await prisma.invoice.findFirst({ where: { id: invoiceId, salonId } });
+  if (!invoice) {
+    const error = new Error("Invoice not found");
+    error.status = 404;
+    throw error;
+  }
+  return prisma.invoice.update({
+    where: { id: invoice.id },
+    data: {
+      paymentLinkToken: token,
+      paymentLinkStatus: "PENDING",
+      paymentLinkExpiresAt: expiresAt ? new Date(expiresAt) : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      notes: note ? `${invoice.notes || ""}\nPayment Link: ${note}`.trim() : invoice.notes
+    }
+  });
+};
+
+export const logPaymentLinkPlaceholder = async ({ salonId, invoiceId, status, note, gatewayRef }) => {
+  return prisma.$transaction(async (tx) => {
+    const invoice = await tx.invoice.findFirst({ where: { id: invoiceId, salonId } });
+    if (!invoice) {
+      const error = new Error("Invoice not found");
+      error.status = 404;
+      throw error;
+    }
+
+    const normalizedStatus = status === "PAID_PLACEHOLDER" ? "PAID" : status;
+    await tx.invoice.update({
+      where: { id: invoice.id },
+      data: {
+        paymentLinkStatus: normalizedStatus,
+        notes: [invoice.notes, note ? `Payment Link ${status}: ${note}` : `Payment Link ${status}`].filter(Boolean).join("\n")
+      }
+    });
+
+    return tx.payment.create({
+      data: {
+        salonId,
+        invoiceId: invoice.id,
+        amount: 0,
+        mode: "ONLINE",
+        note: note || `Payment link ${status.toLowerCase()} placeholder`,
+        type: status === "FAILED" ? "PAYMENT_LINK_FAILED" : status === "SENT" ? "PAYMENT_LINK_SENT" : "PAYMENT_LINK_PAID_PLACEHOLDER",
+        onlineStatus: normalizedStatus,
+        gatewayRef: gatewayRef || null
+      }
+    });
+  });
+};
+
+export const getDayClosingSummary = async ({ salonId, branchId, date }) => {
+  const rawDate = date && date !== "undefined" && date !== "null" ? new Date(date) : new Date();
+  const start = isNaN(rawDate.getTime()) ? new Date() : rawDate;
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+
+  const invoices = await prisma.invoice.findMany({
+    where: {
+      salonId,
+      ...(branchId ? { branchId } : {}),
+      createdAt: { gte: start, lt: end }
+    },
+    include: { payments: true }
+  });
+
+  const payments = invoices.flatMap((invoice) => invoice.payments);
+  const paymentSummary = payments.reduce((acc, payment) => {
+    acc[payment.mode] = (acc[payment.mode] || 0) + toAmount(payment.amount);
+    return acc;
+  }, {});
+
+  return {
+    invoiceCount: invoices.length,
+    grossSales: invoices.reduce((sum, invoice) => sum + toAmount(invoice.total), 0),
+    paidAmount: invoices.reduce((sum, invoice) => sum + toAmount(invoice.paidAmount), 0),
+    refunds: invoices.reduce((sum, invoice) => sum + toAmount(invoice.refundAmount), 0),
+    cashDrawer: toAmount(paymentSummary.CASH || 0),
+    paymentSummary
+  };
+};

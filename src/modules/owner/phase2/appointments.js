@@ -1,0 +1,893 @@
+import crypto from "crypto";
+import { prisma } from "../../../lib/prisma.js";
+import { getNotificationToggles, maybeSendFeedbackRequestForAppointment } from "../../../lib/emailAutomation.js";
+import { attemptCustomerTemplateEmail } from "../../../lib/emailNotifications.js";
+import { checkStaffAvailability, ensureScopedBranch, ensureScopedCustomer, ensureScopedService, ensureScopedStaffMembership, getSalonSetting, logCustomerTimeline, normalizeBranchId, toAmount } from "../../../lib/phase2.js";
+import { createCustomerNotification, createStaffNotification } from "../../../lib/phase4.js";
+import { requireFeatureEnabled, requireSalonPermission } from "../../../middlewares/rbac.js";
+import { schemas, validate } from "../../../middlewares/validate.js";
+import { assignAppointmentItems, buildAppointmentScope, canAccessAppointment, fetchAppointment, logAppointmentChange, nextNumber } from "./shared.js";
+
+const sendRouteError = (res, error, fallbackMessage) => {
+  const status = error?.status || error?.response?.status || 500;
+  const message = error?.message || fallbackMessage;
+  return res.status(status).json({ message });
+};
+
+/**
+ * Send appointment email only if the relevant toggle is ON.
+ * Also creates in-app notifications for customer and (where applicable) all salon staff.
+ */
+const dispatchAppointmentEvent = async (salonId, appointmentId, {
+  toggleKey,             // e.g. "appointmentConfirmedToCustomer"
+  templateType,          // e.g. "appointment_confirmation"
+  ownerToggleKey = null, // e.g. "appointmentCreatedToOwner"
+  ownerTitle = null,
+  ownerMessage = null,
+  staffToggleKey = null, // e.g. "appointmentMsgToStaff"
+  staffTitle = null,
+  staffMessage = null,
+  branchId = null,
+  forceCustomerEmail = false,
+  skipCustomerEmail = false,
+  forceOwnerEmail = false,
+  skipOwnerEmail = false
+}) => {
+  try {
+    const appointment = await fetchAppointment(salonId, appointmentId);
+    if (!appointment) return { skipped: true, reason: "appointment-not-found" };
+
+    const { isOn, emailEnabled } = await getNotificationToggles(salonId, branchId || appointment.branchId);
+
+    // Master switch: if messageForAppointments is OFF, suppress all appointment notifications
+    if (!isOn("messageForAppointments") && !forceCustomerEmail && !forceOwnerEmail) return { skipped: true, reason: "messageForAppointments-disabled" };
+
+    // 1. Customer email
+    const customerEmail = appointment?.customer?.email || "";
+    if (!skipCustomerEmail && (forceCustomerEmail || (toggleKey && isOn(toggleKey))) && emailEnabled && customerEmail) {
+      await attemptCustomerTemplateEmail({
+        salonId,
+        toEmail: customerEmail,
+        templateType,
+        context: { appointmentId, customerId: appointment.customerId }
+      }).catch((err) => console.error(`[appt-email] ${templateType}:`, err.message));
+    }
+
+    // 2. Customer in-app notification
+    if (toggleKey && isOn(toggleKey) && appointment.customerId) {
+      const labelMap = {
+        appointment_confirmation: "Appointment Confirmed",
+        appointment_cancelled: "Appointment Cancelled",
+        appointment_reminder: "Appointment Reminder",
+        feedback_follow_up: "Feedback Request"
+      };
+      await createCustomerNotification({
+        salonId,
+        customerId: appointment.customerId,
+        title: labelMap[templateType] || "Appointment Update",
+        message: `Your appointment at ${new Date(appointment.startAt).toLocaleString()} has been updated.`
+      }).catch(() => {});
+    }
+
+    // 3. Owner / salon-wide in-app notification + email
+    if (!skipOwnerEmail && (forceOwnerEmail || (ownerToggleKey && isOn(ownerToggleKey))) && ownerTitle) {
+      await createStaffNotification({
+        salonId,
+        userSalonId: null, // null = broadcast to all staff with access
+        title: ownerTitle,
+        message: ownerMessage || ownerTitle,
+        type: "APPOINTMENT",
+        linkUrl: `/admin/appointments/${appointmentId}`
+      }).catch(() => {});
+
+      // Send actual email to salon owner
+      if (forceOwnerEmail && emailEnabled) {
+        const salonOwner = await prisma.userSalon.findFirst({
+          where: { salonId, salonRole: "SALON_OWNER" },
+          include: { user: true }
+        });
+        const ownerEmail = salonOwner?.user?.email;
+        if (ownerEmail) {
+          await attemptCustomerTemplateEmail({
+            salonId,
+            toEmail: ownerEmail,
+            templateType: "appointment_confirmation",
+            context: { appointmentId, customerId: appointment.customerId }
+          }).catch(() => {});
+        }
+      }
+    }
+
+    // 4. Staff in-app notification
+    if (staffToggleKey && isOn(staffToggleKey) && staffTitle) {
+      // Notify all assigned staff members
+      const staffIds = (appointment.items || [])
+        .flatMap((item) => (item.assignedStaff || []).map((s) => s.userSalonId));
+      const uniqueStaffIds = [...new Set(staffIds)];
+      await Promise.allSettled(
+        uniqueStaffIds.map((userSalonId) =>
+          createStaffNotification({
+            salonId,
+            userSalonId,
+            title: staffTitle,
+            message: staffMessage || staffTitle,
+            type: "APPOINTMENT",
+            linkUrl: `/admin/appointments/${appointmentId}`
+          })
+        )
+      );
+    }
+  } catch (err) {
+    console.error("[dispatchAppointmentEvent] Error:", err.message);
+  }
+};
+
+export const registerAppointmentRoutes = (ownerRouter) => {
+  ownerRouter.get("/appointments", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "view"), async (req, res) => {
+    const branchId = normalizeBranchId(req.query.branchId);
+    const status = req.query.status ? String(req.query.status) : null;
+    const bookingChannel = req.query.bookingChannel ? String(req.query.bookingChannel) : null;
+    const customerId = req.query.customerId ? String(req.query.customerId) : null;
+    const from = req.query.from ? new Date(String(req.query.from)) : null;
+    const to = req.query.to ? new Date(String(req.query.to)) : null;
+    const take = Math.min(Number(req.query.take) || 100, 500);
+    const skip = Number(req.query.skip) || 0;
+    const where = {
+      ...buildAppointmentScope(req, branchId),
+      ...(status ? { status } : {}),
+      ...(bookingChannel ? { bookingChannel } : {}),
+      ...(customerId ? { customerId } : {}),
+      ...((from || to) ? {
+        startAt: {
+          ...(from ? { gte: from } : {}),
+          ...(to ? { lte: to } : {})
+        }
+      } : {})
+    };
+    const [result, total] = await Promise.all([
+      prisma.appointment.findMany({
+        where,
+        include: {
+          customer: true,
+          branch: true,
+          primaryStaff: { include: { user: true } },
+          items: { include: { service: true, assignedStaff: { include: { userSalon: { include: { user: true } } } } } }
+        },
+        orderBy: { startAt: "asc" },
+        take,
+        skip
+      }),
+      prisma.appointment.count({ where })
+    ]);
+    res.json({ data: result, total });
+  });
+
+  ownerRouter.get("/appointments/calendar", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "view"), async (req, res) => {
+    const branchId = normalizeBranchId(req.query.branchId);
+    const from = req.query.from ? new Date(String(req.query.from)) : new Date();
+    const to = req.query.to ? new Date(String(req.query.to)) : new Date(from.getTime() + 7 * 24 * 60 * 60 * 1000);
+    res.json(await prisma.appointment.findMany({
+      where: { ...buildAppointmentScope(req, branchId), startAt: { gte: from, lte: to } },
+      include: {
+        customer: true,
+        primaryStaff: { include: { user: true } },
+        items: { include: { service: true, assignedStaff: { include: { userSalon: { include: { user: true } } } } } }
+      },
+      orderBy: { startAt: "asc" }
+    }));
+  });
+
+  ownerRouter.get("/appointments/pending-online", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "view"), async (req, res) => {
+    const branchId = normalizeBranchId(req.query.branchId);
+    const rows = await prisma.appointment.findMany({
+      where: {
+        ...buildAppointmentScope(req, branchId),
+        bookingChannel: "ONLINE",
+        status: { notIn: ["CANCELLED", "COMPLETED"] },
+        primaryStaffUserId: null
+      },
+      include: {
+        customer: true,
+        branch: true,
+        primaryStaff: { include: { user: true } },
+        items: { include: { service: true, assignedStaff: { include: { userSalon: { include: { user: true } } } } } }
+      },
+      orderBy: { startAt: "asc" },
+      take: 200
+    });
+    res.json(rows);
+  });
+
+  ownerRouter.get("/appointments/pending-unassigned", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "view"), async (req, res) => {
+    const branchId = normalizeBranchId(req.query.branchId);
+    const rows = await prisma.appointment.findMany({
+      where: {
+        ...buildAppointmentScope(req, branchId),
+        bookingChannel: { not: "ONLINE" },
+        status: { notIn: ["CANCELLED", "COMPLETED"] },
+        primaryStaffUserId: null
+      },
+      include: {
+        customer: true,
+        branch: true,
+        primaryStaff: { include: { user: true } },
+        items: { include: { service: true, assignedStaff: { include: { userSalon: { include: { user: true } } } } } }
+      },
+      orderBy: { startAt: "asc" },
+      take: 200
+    });
+    res.json(rows);
+  });
+
+  ownerRouter.get("/appointments/:id", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "view"), async (req, res) => {
+    const appointment = await fetchAppointment(req.salonId, req.params.id);
+    if (!appointment) return res.status(404).json({ message: "Appointment not found" });
+    if (!canAccessAppointment(req, appointment)) return res.status(403).json({ message: "You can only view your assigned appointments" });
+    res.json(appointment);
+  });
+
+  ownerRouter.post("/appointments", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "create"), validate(schemas.appointment), async (req, res) => {
+    try {
+      const body = req.body;
+      await ensureScopedCustomer(req.salonId, body.customerId);
+      await ensureScopedBranch(req.salonId, body.branchId);
+
+      const salonSetting = await prisma.salonSetting.findFirst({ where: { salonId: req.salonId, branchId: null } });
+      const advancedSettings = salonSetting?.advancedSettings || {};
+      if (advancedSettings.allowBackdatedAppointments !== true && body.startAt && new Date(body.startAt) < new Date(new Date().toDateString())) {
+        return res.status(400).json({ message: "Backdated appointments are restricted by salon settings" });
+      }
+
+      for (const item of body.items) {
+        const service = await ensureScopedService(req.salonId, item.serviceId);
+        if (service.branchId && service.branchId !== body.branchId) {
+          return res.status(400).json({ message: `${service.name} does not belong to the selected branch` });
+        }
+        for (const staffUserId of (item.staffUserIds || [])) {
+          const membership = await ensureScopedStaffMembership(req.salonId, staffUserId);
+          const assignedServiceIds = membership.serviceAssignments.map((assignment) => assignment.serviceId);
+          if (assignedServiceIds.length && !assignedServiceIds.includes(item.serviceId)) {
+            return res.status(400).json({ message: `${membership.user.name} is not assigned to ${service.name}` });
+          }
+        }
+        if (item.staffUserIds?.length) {
+          await checkStaffAvailability({
+            salonId: req.salonId,
+            branchId: body.branchId,
+            staffMembershipIds: item.staffUserIds,
+            startAt: item.startAt,
+            endAt: item.endAt
+          });
+        }
+      }
+
+      const settings = await prisma.appointmentSetting.findFirst({ where: { salonId: req.salonId, branchId: body.branchId } })
+        || await prisma.appointmentSetting.findFirst({ where: { salonId: req.salonId, branchId: null } });
+
+      // Check for rapid duplicate submission (within 3 seconds)
+      const recentDuplicate = await prisma.appointment.findFirst({
+        where: {
+          salonId: req.salonId,
+          customerId: body.customerId,
+          branchId: body.branchId,
+          startAt: new Date(body.startAt),
+          createdAt: { gte: new Date(Date.now() - 3000) }
+        }
+      });
+      if (recentDuplicate) {
+        return res.json(await fetchAppointment(req.salonId, recentDuplicate.id));
+      }
+
+      const createdId = await prisma.$transaction(async (tx) => {
+        const appointment = await tx.appointment.create({
+          data: {
+            salonId: req.salonId,
+            branchId: body.branchId,
+            customerId: body.customerId,
+            primaryStaffUserId: body.primaryStaffUserId || body.items[0]?.staffUserIds?.[0] || null,
+            createdByMembershipId: req.user.membershipId || null,
+            title: body.title || null,
+            bookingChannel: body.bookingChannel,
+            status: body.status || (settings?.autoConfirm !== false ? "CONFIRMED" : "PENDING"),
+            startAt: new Date(body.startAt),
+            endAt: new Date(body.endAt),
+            notes: body.notes || null,
+            customerPreferences: body.customerPreferences || null,
+            isWalkIn: Boolean(body.isWalkIn),
+            approvalStatus: settings?.autoConfirm === false ? "PENDING" : "APPROVED",
+            advancePaymentRequired: body.advancePaymentRequired ?? settings?.advancePaymentRequired ?? false,
+            advancePaidAmount: body.advancePaidAmount || 0,
+            selfCancelToken: crypto.randomBytes(18).toString("hex"),
+            selfRescheduleToken: crypto.randomBytes(18).toString("hex"),
+            roomResourceNote: body.roomResourceNote || null
+          }
+        });
+        await assignAppointmentItems(tx, appointment.id, body.items);
+        await logAppointmentChange(tx, appointment.id, req.user.id, "CREATED", null, appointment.status, "Appointment created");
+        await logCustomerTimeline(tx, body.customerId, "APPOINTMENT", "Appointment booked", `Booking on ${new Date(body.startAt).toLocaleString()}`, appointment.id);
+        return appointment.id;
+      });
+
+      const created = await fetchAppointment(req.salonId, createdId);
+      // Dispatch: confirm email to customer + notify owner + notify assigned staff
+      const staffIdsToNotify = [...new Set((created.items || []).flatMap(i => (i.assignedStaff || []).map(s => s.userSalonId)))];
+      for (const staffId of staffIdsToNotify) {
+        createStaffNotification({
+          salonId: req.salonId,
+          userSalonId: staffId,
+          title: "New Appointment Assigned",
+          message: `You have a new appointment on ${new Date(body.startAt).toLocaleString()}.`,
+          type: "APPOINTMENT",
+          linkUrl: `/admin/appointments/${created.id}`
+        }).catch(err => console.error("Failed to notify staff:", err));
+      }
+
+      void dispatchAppointmentEvent(req.salonId, createdId, {
+        toggleKey: "appointmentConfirmedToCustomer",
+        templateType: "appointment_confirmation",
+        ownerToggleKey: body.bookingChannel === "ONLINE" ? "onlineAppointmentBookedToOwner" : "appointmentCreatedToOwner",
+        ownerTitle: body.bookingChannel === "ONLINE" ? "New Online Appointment Booked" : "New Appointment Created",
+        ownerMessage: `A new appointment has been booked for ${new Date(body.startAt).toLocaleString()}.`,
+        staffToggleKey: "appointmentMsgToStaff",
+        staffTitle: "New Appointment Assigned",
+        staffMessage: `You have a new appointment on ${new Date(body.startAt).toLocaleString()}.`,
+        forceCustomerEmail: body.smsToGuest === true,
+        skipCustomerEmail: body.smsToGuest === false,
+        forceOwnerEmail: body.smsToOwner === true,
+        skipOwnerEmail: body.smsToOwner === false
+      });
+      res.status(201).json(created);
+    } catch (error) {
+      return sendRouteError(res, error, "Could not create appointment");
+    }
+  });
+
+  ownerRouter.patch("/appointments/:id", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "edit"), validate(schemas.appointment), async (req, res) => {
+    try {
+      const existing = await fetchAppointment(req.salonId, req.params.id);
+      if (!existing) return res.status(404).json({ message: "Appointment not found" });
+      if (!canAccessAppointment(req, existing)) return res.status(403).json({ message: "You can only edit your assigned appointments" });
+
+      await ensureScopedCustomer(req.salonId, req.body.customerId);
+      await ensureScopedBranch(req.salonId, req.body.branchId);
+
+      for (const item of req.body.items) {
+        const service = await ensureScopedService(req.salonId, item.serviceId);
+        if (service.branchId && service.branchId !== req.body.branchId) {
+          return res.status(400).json({ message: `${service.name} does not belong to the selected branch` });
+        }
+        for (const staffUserId of (item.staffUserIds || [])) {
+          const membership = await ensureScopedStaffMembership(req.salonId, staffUserId);
+          const assignedServiceIds = membership.serviceAssignments.map((assignment) => assignment.serviceId);
+          if (assignedServiceIds.length && !assignedServiceIds.includes(item.serviceId)) {
+            return res.status(400).json({ message: `${membership.user.name} is not assigned to ${service.name}` });
+          }
+        }
+        if (item.staffUserIds?.length) {
+          await checkStaffAvailability({
+            salonId: req.salonId,
+            branchId: req.body.branchId,
+            staffMembershipIds: item.staffUserIds,
+            startAt: item.startAt,
+            endAt: item.endAt,
+            appointmentIdToExclude: existing.id
+          });
+        }
+      }
+
+      await prisma.$transaction(async (tx) => {
+        await tx.appointment.update({
+          where: { id: existing.id },
+          data: {
+            branchId: req.body.branchId,
+            customerId: req.body.customerId,
+            primaryStaffUserId: req.body.primaryStaffUserId || req.body.items[0]?.staffUserIds?.[0] || null,
+            title: req.body.title || null,
+            bookingChannel: req.body.bookingChannel,
+            status: req.body.status || existing.status,
+            startAt: new Date(req.body.startAt),
+            endAt: new Date(req.body.endAt),
+            notes: req.body.notes || null,
+            customerPreferences: req.body.customerPreferences || null,
+            isWalkIn: Boolean(req.body.isWalkIn),
+            advancePaymentRequired: Boolean(req.body.advancePaymentRequired),
+            advancePaidAmount: req.body.advancePaidAmount || 0,
+            roomResourceNote: req.body.roomResourceNote || null
+          }
+        });
+        await assignAppointmentItems(tx, existing.id, req.body.items);
+        await logAppointmentChange(tx, existing.id, req.user.id, "UPDATED", existing.status, req.body.status || existing.status, "Appointment updated");
+      });
+
+      const updated = await fetchAppointment(req.salonId, existing.id);
+      void dispatchAppointmentEvent(req.salonId, existing.id, {
+        toggleKey: "appointmentRescheduledToCustomer",
+        templateType: "appointment_confirmation",
+        staffToggleKey: "appointmentMsgToStaff",
+        staffTitle: "Appointment Updated",
+        staffMessage: `Your appointment has been updated for ${new Date(req.body.startAt).toLocaleString()}.`
+      });
+      res.json(updated);
+    } catch (error) {
+      return sendRouteError(res, error, "Could not update appointment");
+    }
+  });
+
+  ownerRouter.delete("/appointments/:id", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "edit"), async (req, res) => {
+    try {
+      const appointment = await prisma.appointment.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+      if (!appointment) return res.status(404).json({ message: "Appointment not found" });
+      const fullAppointment = await fetchAppointment(req.salonId, appointment.id);
+      if (!canAccessAppointment(req, fullAppointment)) return res.status(403).json({ message: "You can only delete your assigned appointments" });
+
+      await prisma.$transaction(async (tx) => {
+        const apptServices = await tx.appointmentService.findMany({ where: { appointmentId: appointment.id } });
+        const apptServiceIds = apptServices.map(s => s.id);
+
+        await tx.appointmentServiceStaff.deleteMany({ where: { appointmentServiceId: { in: apptServiceIds } } });
+        await tx.appointmentService.deleteMany({ where: { appointmentId: appointment.id } });
+        await tx.appointmentLog.deleteMany({ where: { appointmentId: appointment.id } });
+        await tx.invoice.updateMany({ where: { appointmentId: appointment.id }, data: { appointmentId: null } });
+        await tx.appointment.delete({ where: { id: appointment.id } });
+      });
+
+      res.json({ message: "Appointment deleted successfully" });
+    } catch (error) {
+      return sendRouteError(res, error, "Could not delete appointment");
+    }
+  });
+
+  ownerRouter.patch("/appointments/:id/status", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "edit"), validate(schemas.appointmentStatus), async (req, res) => {
+    const appointment = await prisma.appointment.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+    if (!appointment) return res.status(404).json({ message: "Appointment not found" });
+    const fullAppointment = await fetchAppointment(req.salonId, appointment.id);
+    if (!canAccessAppointment(req, fullAppointment)) return res.status(403).json({ message: "You can only update your assigned appointments" });
+    await prisma.$transaction(async (tx) => {
+      const updateData = { status: req.body.status };
+      if (req.body.status === "IN_PROGRESS" && appointment.status !== "IN_PROGRESS") updateData.actualStartedAt = new Date();
+      if (req.body.status === "COMPLETED" && appointment.status !== "COMPLETED") updateData.actualCompletedAt = new Date();
+      
+      await tx.appointment.update({ where: { id: appointment.id }, data: updateData });
+      await logAppointmentChange(tx, appointment.id, req.user.id, "STATUS_CHANGED", appointment.status, req.body.status, req.body.note || null);
+    });
+    if (req.body.status === "IN_PROGRESS") {
+      try {
+        const fullAppt = await fetchAppointment(req.salonId, appointment.id);
+        if (fullAppt && !fullAppt.convertedInvoiceId) {
+          const existingInvoice = await prisma.invoice.findFirst({ where: { appointmentId: appointment.id, salonId: req.salonId, status: "STARTED" } });
+          if (!existingInvoice) {
+            const { createInvoiceNumber } = await import("../../../lib/pos.js");
+            const invoiceNumber = await createInvoiceNumber(prisma, req.salonId, appointment.branchId);
+            let subtotal = 0;
+            let totalTax = 0;
+            const invoiceItems = (fullAppt.items || []).map(item => {
+              const svcPrice = Number(item.service?.price || 0);
+              const itemTaxPct = Number(item.service?.taxRate || 0);
+              const lineTax = (svcPrice * itemTaxPct) / 100;
+              subtotal += svcPrice;
+              totalTax += lineTax;
+              return {
+                serviceName: item.service?.name || "Service",
+                staffName: item.assignedStaff?.[0]?.userSalon?.user?.name || null,
+                staffUserSalonId: item.assignedStaff?.[0]?.userSalonId || null,
+                serviceId: item.serviceId,
+                qty: 1,
+                unitPrice: svcPrice,
+                taxPct: itemTaxPct,
+                lineTotal: svcPrice + lineTax,
+                itemType: "SERVICE"
+              };
+            });
+            const total = subtotal + totalTax;
+            const newInvoice = await prisma.invoice.create({
+              data: {
+                salonId: req.salonId,
+                branchId: appointment.branchId,
+                customerId: appointment.customerId,
+                appointmentId: appointment.id,
+                invoiceNumber,
+                status: "STARTED",
+                startedAt: new Date(),
+                subtotal,
+                discount: 0,
+                tax: totalTax,
+                total,
+                paidAmount: 0,
+                balanceAmount: total,
+                items: { create: invoiceItems }
+              }
+            });
+            await prisma.appointment.update({ where: { id: appointment.id }, data: { convertedInvoiceId: newInvoice.id } });
+          }
+        }
+      } catch (invoiceErr) {
+        console.error("Failed to create STARTED invoice for appointment:", invoiceErr);
+      }
+    } else if (req.body.status === "CONFIRMED") {
+      void dispatchAppointmentEvent(req.salonId, appointment.id, {
+        toggleKey: "appointmentConfirmedToCustomer",
+        templateType: "appointment_confirmation",
+        staffToggleKey: "appointmentMsgToStaff",
+        staffTitle: "Appointment Confirmed",
+        staffMessage: `An appointment has been confirmed.`
+      });
+    } else if (req.body.status === "CANCELLED") {
+      void dispatchAppointmentEvent(req.salonId, appointment.id, {
+        toggleKey: "appointmentCancelledToCustomer",
+        templateType: "appointment_cancelled",
+        ownerToggleKey: "appointmentCancelledToOwner",
+        ownerTitle: "Appointment Cancelled",
+        ownerMessage: `An appointment has been cancelled by status update.`
+      });
+    } else if (req.body.status === "COMPLETED") {
+      // Check appointmentFeedbackLink toggle before sending feedback email
+      const { isOn } = await getNotificationToggles(req.salonId, appointment.branchId);
+      if (isOn("appointmentFeedbackLink")) {
+        await maybeSendFeedbackRequestForAppointment({
+          salonId: req.salonId,
+          appointmentId: appointment.id,
+          actorUserId: req.user.id,
+          actorMembershipId: req.user.membershipId
+        });
+      }
+    }
+    res.json(await fetchAppointment(req.salonId, appointment.id));
+  });
+
+
+  ownerRouter.patch("/appointments/:id/assign-staff", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "edit"), async (req, res) => {
+    try {
+      const { staffId, startAt, endAt } = req.body;
+      const appointment = await fetchAppointment(req.salonId, req.params.id);
+      if (!appointment) return res.status(404).json({ message: "Appointment not found" });
+
+      await prisma.$transaction(async (tx) => {
+        // Update appointment times and staff
+        await tx.appointment.update({
+          where: { id: appointment.id },
+          data: { 
+            startAt: new Date(startAt), 
+            endAt: new Date(endAt),
+            status: "CONFIRMED",
+            primaryStaffUserId: staffId || null
+          }
+        });
+
+        // Update services and staff
+        for (const item of appointment.items) {
+          await tx.appointmentService.update({
+            where: { id: item.id },
+            data: { startAt: startAt ? new Date(startAt) : (item.startAt || appointment.startAt), endAt: endAt ? new Date(endAt) : (item.endAt || appointment.endAt) }
+          });
+          
+          await tx.appointmentServiceStaff.deleteMany({
+            where: { appointmentServiceId: item.id }
+          });
+
+          if (staffId) {
+            await tx.appointmentServiceStaff.create({
+              data: {
+                appointmentServiceId: item.id,
+                userSalonId: staffId
+              }
+            });
+          }
+        }
+
+        await logAppointmentChange(tx, appointment.id, req.user?.id, "UPDATED", appointment.status, "CONFIRMED", "Staff assigned and scheduled");
+      });
+
+      // Send notification to the newly assigned staff
+      if (staffId) {
+        if (createStaffNotification) {
+          createStaffNotification({
+            salonId: req.salonId,
+            userSalonId: staffId,
+            title: "New Appointment Assigned",
+            message: `You have been assigned an appointment on ${new Date(startAt).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })}.`,
+            type: "APPOINTMENT",
+            linkUrl: `/admin/my-appointments`
+          }).catch(err => console.error("Failed to notify staff:", err));
+        }
+      }
+
+      res.json(await fetchAppointment(req.salonId, appointment.id));
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ message: "Could not assign staff" });
+    }
+  });
+
+  ownerRouter.post("/appointments/:id/cancel", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "edit"), validate(schemas.appointmentNote), async (req, res) => {
+    const appointment = await fetchAppointment(req.salonId, req.params.id);
+    if (!appointment) return res.status(404).json({ message: "Appointment not found" });
+    if (!canAccessAppointment(req, appointment)) return res.status(403).json({ message: "You can only cancel your assigned appointments" });
+    if (appointment.status === "CANCELLED") return res.status(400).json({ message: "Appointment already cancelled" });
+
+    await prisma.$transaction(async (tx) => {
+      await tx.appointment.update({ where: { id: appointment.id }, data: { status: "CANCELLED" } });
+      await logAppointmentChange(tx, appointment.id, req.user.id, "CANCELLED", appointment.status, "CANCELLED", req.body.note || "Appointment cancelled");
+    });
+
+    void dispatchAppointmentEvent(req.salonId, appointment.id, {
+      toggleKey: "appointmentCancelledToCustomer",
+      templateType: "appointment_cancelled",
+      ownerToggleKey: "appointmentCancelledToOwner",
+      ownerTitle: "Appointment Cancelled",
+      ownerMessage: `An appointment has been cancelled.`
+    });
+    res.json(await fetchAppointment(req.salonId, appointment.id));
+  });
+
+  ownerRouter.post("/appointments/:id/reschedule", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "edit"), validate(schemas.appointmentReschedule), async (req, res) => {
+    try {
+      const appointment = await fetchAppointment(req.salonId, req.params.id);
+      if (!appointment) return res.status(404).json({ message: "Appointment not found" });
+      if (!canAccessAppointment(req, appointment)) return res.status(403).json({ message: "You can only reschedule your assigned appointments" });
+
+      const items = appointment.items.map((item) => ({
+        serviceId: item.serviceId,
+        staffUserIds: item.assignedStaff.map((assignment) => assignment.userSalonId),
+        startAt: req.body.startAt,
+        endAt: req.body.endAt,
+        notes: item.notes || ""
+      }));
+
+      for (const item of items) {
+        const service = await ensureScopedService(req.salonId, item.serviceId);
+        for (const staffUserId of item.staffUserIds) {
+          const membership = await ensureScopedStaffMembership(req.salonId, staffUserId);
+          const assignedServiceIds = membership.serviceAssignments.map((assignment) => assignment.serviceId);
+          if (assignedServiceIds.length && !assignedServiceIds.includes(item.serviceId)) {
+            return res.status(400).json({ message: `${membership.user.name} is not assigned to ${service.name}` });
+          }
+        }
+        await checkStaffAvailability({
+          salonId: req.salonId,
+          branchId: req.body.branchId || appointment.branchId,
+          staffMembershipIds: item.staffUserIds,
+          startAt: item.startAt,
+          endAt: item.endAt,
+          appointmentIdToExclude: appointment.id
+        });
+      }
+
+      await prisma.$transaction(async (tx) => {
+        await tx.appointment.update({
+          where: { id: appointment.id },
+          data: {
+            branchId: req.body.branchId || appointment.branchId,
+            startAt: new Date(req.body.startAt),
+            endAt: new Date(req.body.endAt),
+            status: appointment.status === "CANCELLED" ? "CONFIRMED" : appointment.status
+          }
+        });
+        await tx.appointmentService.updateMany({
+          where: { appointmentId: appointment.id },
+          data: {
+            startAt: new Date(req.body.startAt),
+            endAt: new Date(req.body.endAt)
+          }
+        });
+        await logAppointmentChange(tx, appointment.id, req.user.id, "RESCHEDULED", appointment.status, appointment.status, req.body.note || "Appointment rescheduled");
+      });
+
+      const updated = await fetchAppointment(req.salonId, appointment.id);
+      void dispatchAppointmentEvent(req.salonId, appointment.id, {
+        toggleKey: "appointmentRescheduledToCustomer",
+        templateType: "appointment_confirmation",
+        staffToggleKey: "appointmentMsgToStaff",
+        staffTitle: "Appointment Rescheduled",
+        staffMessage: `Your appointment has been rescheduled to ${new Date(req.body.startAt).toLocaleString()}.`
+      });
+      res.json(updated);
+    } catch (error) {
+      return sendRouteError(res, error, "Could not reschedule appointment");
+    }
+  });
+
+  ownerRouter.get("/appointments/:id/self-links", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "view"), async (req, res) => {
+    const appointment = await prisma.appointment.findFirst({ where: { id: req.params.id, salonId: req.salonId } });
+    if (!appointment) return res.status(404).json({ message: "Appointment not found" });
+    const frontendBase = process.env.FRONTEND_APP_URL || "http://127.0.0.1:5173";
+    res.json({
+      cancelUrl: `${frontendBase}/self/appointments/${appointment.selfCancelToken}/cancel`,
+      rescheduleUrl: `${frontendBase}/self/appointments/${appointment.selfRescheduleToken}/reschedule`,
+      approvalStatus: appointment.approvalStatus || "APPROVED"
+    });
+  });
+
+  ownerRouter.post("/appointments/:id/convert-to-invoice", requireFeatureEnabled("appointments"), requireSalonPermission("pos", "create"), async (req, res) => {
+    const appointment = await prisma.appointment.findFirst({
+      where: { id: req.params.id, salonId: req.salonId },
+      include: { items: { include: { service: { include: { consumables: { include: { product: true } } } }, assignedStaff: { include: { userSalon: { include: { user: true } } } } } } }
+    });
+    if (!appointment) return res.status(404).json({ message: "Appointment not found" });
+    if (appointment.status !== "COMPLETED") return res.status(400).json({ message: "Only completed appointments can convert to invoice" });
+
+    const consumableOverrides = req.body.consumableOverrides || null;
+
+    const invoice = await prisma.$transaction(async (tx) => {
+      const settings = await getSalonSetting(tx, req.salonId, appointment.branchId);
+      const invoiceNumber = await nextNumber(tx, "invoice", req.salonId, settings?.invoicePrefix || "INV");
+      const items = appointment.items.map((item) => {
+        const unitPrice = toAmount(item.service.price);
+        const taxPct = toAmount(item.service.taxRate || 0);
+        const lineTotal = unitPrice + (unitPrice * taxPct) / 100;
+        const firstStaff = item.assignedStaff[0]?.userSalonId || null;
+        return {
+          serviceName: item.service.name,
+          staffName: item.assignedStaff.map((assignment) => assignment.userSalon?.user?.name || "Staff").join(", "),
+          qty: 1,
+          unitPrice,
+          taxPct,
+          lineTotal,
+          ...(item.serviceId ? { serviceId: item.serviceId } : {}),
+          ...(firstStaff ? { staffUserSalon: { connect: { id: firstStaff } } } : {})
+        };
+      });
+      const subtotal = items.reduce((sum, item) => sum + toAmount(item.unitPrice) * item.qty, 0);
+      const tax = items.reduce((sum, item) => sum + (toAmount(item.unitPrice) * item.qty * toAmount(item.taxPct)) / 100, 0);
+      const total = subtotal + tax;
+
+      const created = await tx.invoice.create({
+        data: {
+          salonId: req.salonId,
+          branchId: appointment.branchId,
+          customerId: appointment.customerId,
+          appointmentId: appointment.id,
+          invoiceNumber,
+          subtotal,
+          discount: 0,
+          tax,
+          total,
+          paidAmount: 0,
+          balanceAmount: total,
+          status: "UNPAID",
+          items: { create: items }
+        }
+      });
+
+      await tx.appointment.update({ where: { id: appointment.id }, data: { convertedInvoiceId: created.id } });
+      await logCustomerTimeline(tx, appointment.customerId, "INVOICE", "Appointment converted to invoice", created.invoiceNumber, created.id);
+
+      // Deduct stock for predefined service consumables (with override support)
+      const { createStockMovement, convertConsumableQty } = await import("../../../lib/phase2.js");
+      for (const item of items) {
+        if (item.serviceId) {
+          const svc = await tx.service.findUnique({ where: { id: item.serviceId }, include: { consumables: { include: { product: true } } } });
+          if (svc && svc.consumables && svc.consumables.length > 0) {
+            const serviceVariation = item.variation || null;
+            const matchedConsumables = svc.consumables.filter(c => c.variation === serviceVariation || (serviceVariation == null && c.variation == null));
+            for (const cons of matchedConsumables.length > 0 ? matchedConsumables : svc.consumables.filter(c => c.variation == null)) {
+              const overrideKey = `${item.serviceId}:${cons.productId}`;
+              const overrideQty = consumableOverrides?.[overrideKey];
+              const rawQty = overrideQty != null ? Number(overrideQty) : Number(cons.reqdQty);
+              const qtyToDeduct = convertConsumableQty(rawQty, cons.product);
+              if (qtyToDeduct > 0) {
+                await createStockMovement(tx, {
+                  salonId: req.salonId,
+                  branchId: appointment.branchId,
+                  productId: cons.productId,
+                  quantity: -qtyToDeduct * Number(item.qty || 1),
+                  movementType: "CONSUMABLE_USAGE",
+                  createdByUserId: req.user.id,
+                  referenceType: "INVOICE",
+                  referenceId: created.id,
+                  note: overrideQty != null ? `Override: ${overrideQty} ${cons.product?.unit || ""} (default: ${cons.reqdQty})` : null,
+                  allowNegativeStock: true
+                });
+              }
+            }
+          }
+        }
+      }
+
+      return created;
+    });
+
+    const customerEmail = invoice?.customer?.email || appointment.customer?.email;
+    if (customerEmail) {
+      const { isOn, emailEnabled } = await getNotificationToggles(req.salonId, invoice.branchId).catch(() => ({ isOn: () => true, emailEnabled: true }));
+      if (isOn("advanceReceivedInvoice") && emailEnabled) {
+        void attemptCustomerTemplateEmail({
+          salonId: req.salonId,
+          toEmail: customerEmail,
+          templateType: "invoice_template",
+          context: { invoiceId: invoice.id, customerId: invoice.customerId }
+        }).catch(() => {});
+      }
+    }
+
+    res.status(201).json(invoice);
+  });
+
+  ownerRouter.get("/appointment-settings", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "view"), async (req, res) => {
+    const branchId = normalizeBranchId(req.query.branchId);
+    const setting = (await prisma.appointmentSetting.findFirst({ where: { salonId: req.salonId, branchId } })) || (await prisma.appointmentSetting.findFirst({ where: { salonId: req.salonId, branchId: null } }));
+    res.json(setting || { salonId: req.salonId, branchId, autoConfirm: true, advancePaymentRequired: false, onlineBookingEnabled: false });
+  });
+
+  ownerRouter.post("/appointment-settings", requireFeatureEnabled("appointments"), requireSalonPermission("appointments", "edit"), validate(schemas.appointmentSettings), async (req, res) => {
+    const branchId = req.body.branchId || null;
+    const existing = await prisma.appointmentSetting.findFirst({ where: { salonId: req.salonId, branchId } });
+    const payload = {
+      salonId: req.salonId,
+      branchId,
+      autoConfirm: req.body.autoConfirm ?? true,
+      advancePaymentRequired: req.body.advancePaymentRequired ?? false,
+      onlineBookingEnabled: req.body.onlineBookingEnabled ?? false
+    };
+    res.status(201).json(existing
+      ? await prisma.appointmentSetting.update({ where: { id: existing.id }, data: payload })
+      : await prisma.appointmentSetting.create({ data: payload }));
+  });
+
+  ownerRouter.get("/staff-schedule", requireSalonPermission("staffSchedule", "view"), async (req, res) => {
+    const branchId = normalizeBranchId(req.query.branchId);
+    res.json(await prisma.staffSchedule.findMany({
+      where: { userSalon: { salonId: req.salonId, ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}) } },
+      include: { userSalon: { include: { user: true, branch: true } } },
+      orderBy: [{ userSalonId: "asc" }, { weekday: "asc" }]
+    }));
+  });
+
+  ownerRouter.post("/staff-schedule", requireSalonPermission("staffSchedule", "edit"), validate(schemas.staffSchedule), async (req, res) => {
+    const membership = await ensureScopedStaffMembership(req.salonId, req.body.userSalonId);
+    res.status(201).json(await prisma.staffSchedule.upsert({
+      where: { userSalonId_weekday: { userSalonId: membership.id, weekday: req.body.weekday } },
+      update: { branchId: req.body.branchId || null, startTime: req.body.startTime, endTime: req.body.endTime, isOffDay: Boolean(req.body.isOffDay) },
+      create: { salonId: req.salonId, branchId: req.body.branchId || null, userSalonId: membership.id, weekday: req.body.weekday, startTime: req.body.startTime, endTime: req.body.endTime, isOffDay: Boolean(req.body.isOffDay) }
+    }));
+  });
+
+  ownerRouter.post("/staff-breaks", requireSalonPermission("staffSchedule", "edit"), validate(schemas.staffBreak), async (req, res) => {
+    const membership = await ensureScopedStaffMembership(req.salonId, req.body.userSalonId);
+    res.status(201).json(await prisma.staffBreak.create({
+      data: {
+        userSalonId: membership.id,
+        weekday: req.body.weekday,
+        startTime: req.body.startTime,
+        endTime: req.body.endTime
+      }
+    }));
+  });
+
+  ownerRouter.get(["/staff-availability", "/appointments/staff-availability"], requireSalonPermission("staffSchedule", "view"), async (req, res) => {
+    const branchId = normalizeBranchId(req.query.branchId);
+    const serviceId = req.query.serviceId ? String(req.query.serviceId) : null;
+    const startAt = req.query.startAt ? new Date(String(req.query.startAt)) : null;
+    const endAt = req.query.endAt ? new Date(String(req.query.endAt)) : null;
+    const memberships = await prisma.userSalon.findMany({
+      where: {
+        salonId: req.salonId,
+        isArchived: false,
+        ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+        ...(serviceId ? { serviceAssignments: { some: { serviceId } } } : {})
+      },
+      include: { user: true, serviceAssignments: true, staffSchedules: true, staffBreaks: true }
+    });
+
+    const results = [];
+    for (const membership of memberships) {
+      let available = true;
+      let reason = null;
+      if (startAt && endAt) {
+        try {
+          await checkStaffAvailability({
+            salonId: req.salonId,
+            branchId,
+            staffMembershipIds: [membership.id],
+            startAt,
+            endAt
+          });
+        } catch (error) {
+          available = false;
+          reason = error.message;
+        }
+      }
+      results.push({ id: membership.id, name: membership.user.name, salonRole: membership.salonRole, available, reason });
+    }
+    res.json(results);
+  });
+};
